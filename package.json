@@ -1,0 +1,55 @@
+{
+  "name": "pi-token-rate",
+  "version": "0.1.0",
+  "description": "Session-wide output-token throughput for pi: live rate, sparkline, peak, and time to first token",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "tokens",
+    "metrics"
+  ],
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ningh123/pi-token-rate.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ningh123/pi-token-rate/issues"
+  },
+  "homepage": "https://github.com/ningh123/pi-token-rate#readme",
+  "author": {
+    "name": "Ning",
+    "email": "ningh@ohmrabbit.com"
+  },
+  "files": [
+    "index.ts",
+    "metrics.ts",
+    "rate-view.ts"
+  ],
+  "exports": {
+    ".": "./index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test \"__tests__/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm test"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@types/node": "^25.9.1",
+    "typescript": "^5.9.3"
+  }
+}
