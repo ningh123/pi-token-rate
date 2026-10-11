@@ -32,6 +32,12 @@ interface Harness {
 	/** Prefs entries appended by the extension. */
 	prefs: { type: string; data: unknown }[];
 	ctx: unknown;
+	/**
+	 * What `ctx.isIdle()` answers: whether pi has an agent run, a compaction, a
+	 * branch summary, a retry or queued work in flight. Tests drive it the way pi
+	 * would, setting it false for the duration of a summarization call.
+	 */
+	setIdle(idle: boolean): void;
 	emit(event: string, payload?: unknown): Promise<void>;
 	command(args?: string): Promise<void>;
 	completions(prefix: string): { value: string; label: string; description?: string }[] | null;
@@ -80,6 +86,11 @@ function createHarness(options: { mode?: "tui" | "print" } = {}): Harness {
 	const ctx = {
 		mode: options.mode ?? "tui",
 		thinkingLevel: "high",
+		// pi raises its own compaction flag before it emits `session_before_compact`
+		// or `session_before_tree`, and lowers it once the call is over, whether it
+		// ended in an entry or was cancelled.
+		busy: false,
+		isIdle: () => !ctx.busy,
 		sessionManager: {
 			getCwd: () => "/tmp/project",
 			getSessionName: () => undefined,
@@ -126,6 +137,9 @@ function createHarness(options: { mode?: "tui" | "print" } = {}): Harness {
 		prefs,
 		get placement() {
 			return harness.placement;
+		},
+		setIdle(idle: boolean) {
+			ctx.busy = !idle;
 		},
 		ctx,
 		async emit(event: string, payload: unknown = {}) {
@@ -420,6 +434,27 @@ describe("lifecycle and commands", () => {
 		assert.equal(harness.widgets.length, 0);
 	});
 
+	it("measures a summarization with no line to show it on", async () => {
+		// The claim that a call is running is a display concern, so it must not be
+		// what decides whether the call is recorded: headless, nothing reconciles it
+		// against pi, and the usage that arrives with the terminal event still counts.
+		const harness = createHarness({ mode: "print" });
+		await harness.emit("session_start", { reason: "startup" });
+		harness.setIdle(false);
+		await harness.emit("session_before_compact", { reason: "manual", signal: new AbortController().signal });
+		harness.setIdle(true);
+		await harness.emit("session_compact", {
+			reason: "manual",
+			compactionEntry: { type: "compaction", usage: { output: 2400 } },
+		});
+		assert.deepEqual(
+			harness.appended.map((entry) => entry.type),
+			["token-rate"],
+			"the record is written even with no widget to reconcile against",
+		);
+		assert.equal(harness.widgets.length, 0);
+	});
+
 	// pi replaces the whole argument text with the chosen value, so the value has
 	// to be the complete text, not just the last word.
 	const applyTab = (harness: Harness, line: string): string | null => {
@@ -492,6 +527,7 @@ describe("lifecycle and commands", () => {
 		await harness.emit("session_start", { reason: "startup" });
 		await stream(harness, 20, 10);
 
+		harness.setIdle(false);
 		await harness.emit("session_before_compact", {
 			reason: "manual",
 			preparation: {},
@@ -499,8 +535,9 @@ describe("lifecycle and commands", () => {
 			willRetry: false,
 			signal: new AbortController().signal,
 		});
-		assert.match(harness.line(), /^⚡ ░ compacting /, "the wait is shown, not a rate that cannot be measured");
+		assert.match(harness.line(), /^⚡ ░ summarizing /, "the wait is shown, not a rate that cannot be measured");
 
+		harness.setIdle(true);
 		await harness.emit("session_compact", {
 			reason: "manual",
 			fromExtension: false,
@@ -524,12 +561,13 @@ describe("lifecycle and commands", () => {
 		assert.equal(persisted?.tokens, 900, "provider-reported, so exact");
 
 		await harness.command("stats");
-		assert.match(harness.notifications.at(-1) ?? "", /1 compaction summary, 900 tok/);
+		assert.match(harness.notifications.at(-1) ?? "", /summaries\s+900 tok\s+1 call/);
 	});
 
 	it("records nothing when a compaction fails", async () => {
 		const harness = createHarness();
 		await harness.emit("session_start", { reason: "startup" });
+		harness.setIdle(false);
 		await harness.emit("session_before_compact", {
 			reason: "manual",
 			preparation: {},
@@ -537,10 +575,171 @@ describe("lifecycle and commands", () => {
 			willRetry: false,
 			signal: new AbortController().signal,
 		});
+		harness.setIdle(true);
 		await harness.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false, fromExtension: false });
 		assert.equal(harness.appended.filter((entry) => entry.type === "token-rate").length, 0);
 		assert.match(harness.line(), /^⚡ /, "back to idle, with no leftover compaction state");
-		assert.doesNotMatch(harness.line(), /compacting/);
+		assert.doesNotMatch(harness.line(), /summarizing/);
+	});
+
+	it("keeps repeated compactions out of the session rates", async () => {
+		// Two replies at 200 and 180 tok/s around two summaries measured end to
+		// end: 3k tokens in 40s (75 tok/s) and 3k in 9s (333 tok/s). Read back from
+		// the session, so this is what a resumed or reloaded session is looking at.
+		const harness = createHarness();
+		harness.branch.push(
+			{
+				type: "custom",
+				customType: "token-rate",
+				data: { tokens: 400, elapsedMs: 2000, ttftMs: 600, ttftFrom: "turn", exact: true },
+			},
+			{ type: "custom", customType: "token-rate", data: { tokens: 3000, elapsedMs: 40_000, kind: "compaction", exact: true } },
+			{ type: "custom", customType: "token-rate", data: { tokens: 3000, elapsedMs: 9000, kind: "compaction", exact: true } },
+			{
+				type: "custom",
+				customType: "token-rate",
+				data: { tokens: 900, elapsedMs: 5000, ttftMs: 800, ttftFrom: "turn", exact: true },
+			},
+		);
+		await harness.emit("session_start", { reason: "resume" });
+
+		const line = harness.line();
+		assert.match(line, /peak 200 tok\/s/, `a summary held the peak: ${line}`);
+		assert.doesNotMatch(line, /75 tok\/s|333 tok\/s/, `a summary reached the line: ${line}`);
+
+		await harness.command("stats");
+		const summary = harness.notifications.at(-1) ?? "";
+		assert.match(summary, /output {2}7\.3k tok\s+2 messages/, summary);
+		assert.match(summary, /throughput {2}186 tok\/s\s+session average · now \S+ tok\/s · peak 200 tok\/s/, summary);
+		assert.match(summary, /spread\s+180 … 200 tok\/s\s+median 190 tok\/s/, summary);
+		assert.match(summary, /first token\s+0\.7s\s+2 of 2 messages timed/, summary);
+		assert.match(summary, /summaries\s+6\.0k tok\s+2 calls · 49\.0s end to end/, summary);
+		assert.match(summary, /summarization is timed end to end/, summary);
+	});
+
+	it("records every compaction of a session separately", async () => {
+		const harness = createHarness();
+		await harness.emit("session_start", { reason: "startup" });
+		for (const tokens of [900, 1500]) {
+			harness.setIdle(false);
+			await harness.emit("session_before_compact", {
+				reason: "threshold",
+				preparation: {},
+				branchEntries: [],
+				willRetry: false,
+				signal: new AbortController().signal,
+			});
+			await sleep(20);
+			harness.setIdle(true);
+			await harness.emit("session_compact", {
+				reason: "threshold",
+				fromExtension: false,
+				willRetry: false,
+				compactionEntry: { type: "compaction", usage: { output: tokens } },
+			});
+		}
+		const records = harness.appended
+			.filter((entry) => entry.type === "token-rate")
+			.map((entry) => entry.data as { kind?: string; tokens: number });
+		assert.deepEqual(
+			records.map((record) => [record.kind, record.tokens]),
+			[
+				["compaction", 900],
+				["compaction", 1500],
+			],
+			"one record per call, and the second call is not folded into the first",
+		);
+		await harness.command("stats");
+		assert.match(harness.notifications.at(-1) ?? "", /summaries\s+2\.4k tok\s+2 calls/);
+	});
+
+	it("times a branch summary the way it times a compaction", async () => {
+		const harness = createHarness();
+		await harness.emit("session_start", { reason: "startup" });
+
+		// A navigation that asks for no summary never calls the model, so it must
+		// not open a call: the line would claim to be waiting on an instant.
+		await harness.emit("session_before_tree", { preparation: { userWantsSummary: false } });
+		await harness.emit("session_tree", { newLeafId: "leaf-2", oldLeafId: "leaf-1" });
+		assert.doesNotMatch(harness.line(), /summarizing/);
+		assert.equal(harness.appended.filter((entry) => entry.type === "token-rate").length, 0);
+
+		harness.setIdle(false);
+		await harness.emit("session_before_tree", { preparation: { userWantsSummary: true, entriesToSummarize: [{}] } });
+		assert.match(harness.line(), /^⚡ ░ summarizing /);
+		harness.setIdle(true);
+		await harness.emit("session_tree", {
+			newLeafId: "leaf-2",
+			oldLeafId: "leaf-1",
+			summaryEntry: { type: "branch_summary", usage: { output: 1800 } },
+		});
+
+		const persisted = harness.appended.filter((entry) => entry.type === "token-rate").at(-1)?.data as
+			| { kind?: string; tokens: number }
+			| undefined;
+		assert.equal(persisted?.kind, "branch-summary");
+		assert.equal(persisted?.tokens, 1800);
+		assert.doesNotMatch(harness.line(), /summarizing/, "the call is over");
+
+		await harness.command("stats");
+		assert.match(harness.notifications.at(-1) ?? "", /summaries\s+1\.8k tok\s+1 call/);
+	});
+
+	it("stops waiting on a branch summary that pi aborted", async () => {
+		// pi emits no terminal event for an aborted summary: `navigateTree` returns
+		// without `session_tree`. The line has to notice on its own, or it waits on
+		// a call that ended until the next turn arrives.
+		const harness = createHarness();
+		await harness.emit("session_start", { reason: "startup" });
+		harness.setIdle(false);
+		await harness.emit("session_before_tree", { preparation: { userWantsSummary: true, entriesToSummarize: [{}] } });
+		assert.match(harness.line(), /^⚡ ░ summarizing /);
+
+		harness.setIdle(true);
+		assert.match(harness.line(), /^⚡ /, "pi has nothing running, so neither does the line");
+		assert.doesNotMatch(harness.line(), /summarizing/);
+		assert.equal(harness.appended.filter((entry) => entry.type === "token-rate").length, 0, "an abort produces nothing");
+	});
+
+	it("keeps a buffered reply buffered across a reload", async () => {
+		// The record is held out of the peak and the average for being a transport
+		// window rather than a generation one, and that has to survive a reload: a
+		// record that reappears as an ordinary one brings back the peak it was
+		// withheld from, with no caveat attached to it.
+		const harness = createHarness();
+		await harness.emit("session_start", { reason: "startup" });
+		await harness.emit("turn_start", {});
+		await harness.emit("message_start", { message: { role: "assistant" } });
+		// The first delta already carries more than a frame's worth of tokens.
+		await harness.emit("message_update", {
+			message: { role: "assistant" },
+			assistantMessageEvent: { type: "text_delta", delta: "x".repeat(800) },
+		});
+		for (let i = 0; i < 40; i++) {
+			await harness.emit("message_update", {
+				message: { role: "assistant" },
+				assistantMessageEvent: { type: "text_delta", delta: "x".repeat(32) },
+			});
+			await sleep(10);
+		}
+		await harness.emit("message_end", completedMessage(450));
+		const stored = harness.appended.at(-1)?.data as { frontLoadedFirstChunk?: boolean };
+		assert.equal(stored.frontLoadedFirstChunk, true, "the flag has to be written to be read back");
+
+		harness.branch.push(
+			{
+				type: "custom",
+				customType: "token-rate",
+				data: { tokens: 100, elapsedMs: 500, ttftFrom: "turn", ttftMs: 40, exact: true },
+			},
+			{ type: "custom", customType: "token-rate", data: harness.appended.at(-1)?.data },
+		);
+		await harness.emit("session_start", { reason: "reload" });
+		await harness.command("stats");
+		const summary = harness.notifications.at(-1) ?? "";
+		assert.match(summary, /1 message front-loaded the first chunk/, summary);
+		assert.match(summary, /throughput {2}200 tok\/s\s+session average · now \S+ tok\/s · peak 200 tok\/s/, summary);
+		assert.doesNotMatch(summary, /measure the delivery of a buffer/, `a normal reply was measurable: ${summary}`);
 	});
 
 	it("defaults to a two-second tick over a thirty-two-second window", async () => {

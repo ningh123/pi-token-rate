@@ -70,7 +70,7 @@ const MIN_TRACE = 8;
 const ICON_WIDTH = 2;
 
 /** Drawn where the trace sits while a call that does not stream is running. */
-const COMPACTING_BAR = "░";
+const SUMMARIZING_BAR = "░";
 
 /**
  * Columns budgeted for the headline rate.
@@ -127,7 +127,7 @@ export interface RateViewSnapshot {
 	/** True once the session has produced or recorded any output. */
 	hasData: boolean;
 	/** What the session is doing right now. */
-	activity: "idle" | "streaming" | "compacting";
+	activity: "idle" | "streaming" | "summarizing";
 	/** Elapsed time of a call that does not stream, 0 otherwise. */
 	silentElapsedMs: number;
 	/** Bars the trace holds at the configured resolution. */
@@ -310,6 +310,16 @@ export class RateView {
 				`${stats.ttftMessages} of ${countLabel(stats.messages, "message")} timed`,
 			);
 		}
+		// Summarization calls get their own row rather than a footnote: they are the
+		// one recorded output whose window measures something else, and a reader
+		// comparing the average against the total has to be able to account for them.
+		if (stats.summaryMessages > 0) {
+			row(
+				"summaries",
+				`${formatTokens(stats.summaryTokens)} tok`,
+				`${countLabel(stats.summaryMessages, "call", "calls")} · ${formatDuration(stats.summaryElapsedMs)} end to end`,
+			);
+		}
 
 		layoutRow();
 		traceRow();
@@ -335,9 +345,9 @@ export class RateView {
 				);
 			}
 		}
-		if (stats.compactionMessages > 0) {
+		if (stats.summaryMessages > 0) {
 			notes.push(
-				`${countLabel(stats.compactionMessages, "compaction summary", "compaction summaries")}, ${formatTokens(stats.compactionTokens)} tok, timed end to end so the rate includes the wait`,
+				"summarization is timed end to end, so it counts towards the output but not towards the average, the peak or the spread",
 			);
 		}
 		notes.push(
@@ -403,12 +413,12 @@ export function buildWidgetLines(
 	// when the rate crosses a digit boundary is the smaller cost.
 	const rate = style("accent", formatRateSegment(snapshot.rate, snapshot.exact));
 
-	if (snapshot.activity === "compacting") {
+	if (snapshot.activity === "summarizing") {
 		// The summary is produced by a call that does not stream to extensions,
 		// so no rate exists while it runs. The elapsed wait is the honest
 		// substitute, and the session figures still hold.
-		const wait = `compacting ${formatDuration(snapshot.silentElapsedMs)}`;
-		const line = `${icon} ${COMPACTING_BAR} ${wait}`;
+		const wait = `summarizing ${formatDuration(snapshot.silentElapsedMs)}`;
+		const line = `${icon} ${SUMMARIZING_BAR} ${wait}`;
 		if (detail === "full" && lineWidth(line, measure) + 12 <= width) {
 			return [`${line}${separator}${formatTokens(snapshot.tokens)} tok`];
 		}

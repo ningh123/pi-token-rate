@@ -663,6 +663,108 @@ describe("SessionRateModel statistics", () => {
 		model.reset();
 		assert.equal(model.stats.messages, 0, "and clearing them invalidates them too");
 	});
+
+	it("keeps a summarization call out of every rate", () => {
+		// One reply at 200 tok/s, then a compaction that took 40s to write 3k
+		// tokens: 75 tok/s end to end, and nothing like the speed of a reply.
+		const model = new SessionRateModel();
+		model.mergeRecord({ tokens: 400, elapsedMs: 2000, ttftFrom: "turn", ttftMs: 600, peakRate: 200, exact: true });
+		model.beginSilentCall("compaction", 10_000);
+		model.endSilentCall(50_000, 3000);
+
+		const stats = model.stats;
+		assert.equal(stats.messages, 1, "a summary is not a reply");
+		assert.equal(stats.totalTokens, 3400, "its output is still the session's output");
+		assert.equal(stats.generationMs, 2000, "but its wait is not generation time");
+		assert.equal(stats.averageRate, 200, "a slow summary cannot deflate the average");
+		assert.equal(stats.peakRate, 200, "nor a fast one hold the peak");
+		assert.equal(stats.rateSpread.slowest, 200, "nor the spread report a window that is not one");
+		assert.equal(stats.summaryMessages, 1);
+		assert.equal(stats.summaryTokens, 3000);
+		assert.equal(stats.summaryElapsedMs, 40_000);
+		assert.equal(stats.meanTtftMs, 600, "the summary has no first token to time");
+	});
+
+	it("lets a fast summarization call set the peak of nothing", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord({ tokens: 400, elapsedMs: 2000, peakRate: 0, exact: true });
+		// 3k tokens in 9s: 333 tok/s, faster than any reply, and not a rate at all.
+		model.beginSilentCall("compaction", 10_000);
+		model.endSilentCall(19_000, 3000);
+		assert.equal(model.stats.peakRate, 200);
+		assert.equal(model.stats.rateSpread.fastest, 200);
+	});
+
+	it("reports a summary as a session with no replies", () => {
+		// A session that only ever compacted still has output, and says so.
+		const model = new SessionRateModel();
+		model.beginSilentCall("compaction", 0);
+		const record = model.endSilentCall(4000, 1200);
+		assert.equal(record?.kind, "compaction");
+		const stats = model.stats;
+		assert.equal(stats.hasData, true);
+		assert.equal(stats.messages, 0);
+		assert.equal(stats.totalTokens, 1200);
+		assert.equal(stats.summaryMessages, 1);
+		assert.equal(stats.averageRate, 0, "there is no reply to average");
+	});
+
+	it("marks a branch summary as one", () => {
+		const model = new SessionRateModel();
+		model.beginSilentCall("branch-summary", 1000);
+		const record = model.endSilentCall(6000, 2400);
+		assert.equal(record?.kind, "branch-summary");
+		assert.equal(model.stats.summaryMessages, 1);
+		assert.equal(model.stats.summaryElapsedMs, 5000);
+	});
+
+	it("records nothing for a summary that reported no usage", () => {
+		const model = new SessionRateModel();
+		model.beginSilentCall("compaction", 0);
+		assert.equal(model.endSilentCall(5000, undefined), undefined);
+		assert.equal(model.isSummarizing, false, "and leaves no call open behind it");
+		assert.equal(model.stats.hasData, false);
+	});
+
+	it("stops claiming a silent call that pi says has ended", () => {
+		// An aborted branch summary emits no terminal event, so the claim has to be
+		// closable from outside or the line waits on a call that ended.
+		const model = new SessionRateModel();
+		model.beginSilentCall("branch-summary", 0);
+		assert.equal(model.isSummarizing, true);
+		assert.equal(model.live(3000).activity, "summarizing");
+		model.noteSilentCallEnded();
+		assert.equal(model.isSummarizing, false);
+		assert.equal(model.live(3000).activity, "idle");
+		assert.equal(model.live(3000).silentElapsedMs, 0);
+		assert.equal(model.stats.hasData, false, "an aborted call produced no output to count");
+	});
+
+	it("still records a summary whose claim was dropped early", () => {
+		// The claim and the measurement are separate on purpose: if pi's own state
+		// is ever briefly wrong, the usage arriving with the terminal event has to
+		// be counted rather than thrown away with the claim.
+		const model = new SessionRateModel();
+		model.beginSilentCall("compaction", 1000);
+		model.noteSilentCallEnded();
+		const record = model.endSilentCall(9000, 2400);
+		assert.equal(record?.tokens, 2400);
+		assert.equal(record?.elapsedMs, 8000, "the wait it was started with is still the measurement");
+		assert.equal(model.stats.summaryTokens, 2400);
+	});
+
+	it("closes a summary a new message supersedes", () => {
+		const model = new SessionRateModel();
+		model.beginSilentCall("compaction", 0);
+		model.beginMessage(4000);
+		assert.equal(model.live(4100).activity, "streaming", "the message is what the line describes now");
+	});
+
+	it("ignores a terminal event for a call that was never opened", () => {
+		const model = new SessionRateModel();
+		assert.equal(model.endSilentCall(5000, 900), undefined, "nothing to time, nothing to record");
+		assert.equal(model.stats.totalTokens, 0);
+	});
 });
 
 describe("sparkline", () => {

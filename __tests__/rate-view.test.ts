@@ -377,6 +377,34 @@ describe("RateView", () => {
 		assert.match(summary, /layout {2}above the editor/, summary);
 	});
 
+	it("shows a summarization call as a wait, not as a rate", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord(record());
+		model.begin(0);
+		model.beginSilentCall("compaction", NOW - 12_400);
+		const [line] = new RateView(model).widgetLines(140, { style: plain, now: NOW });
+		assert.equal(line, "⚡ ░ summarizing 12.4s · 400 tok", line);
+		// Nothing is streaming, so no rate is claimed: the summary cannot produce
+		// one, and the number that used to be on the line is not a measurement.
+		assert.doesNotMatch(line, /tok\/s/, line);
+
+		model.endSilentCall(NOW, 1800);
+		assert.match(new RateView(model).widgetLines(140, { style: plain, now: NOW })[0] ?? "", /^⚡ /);
+	});
+
+	it("gives summarization calls a row of their own", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord(record());
+		model.mergeRecord({ tokens: 3000, elapsedMs: 40_000, peakRate: 0, exact: true, kind: "compaction" });
+		model.begin(0);
+		const summary = new RateView(model).summary(NOW);
+		assert.match(summary, /^ {3}summaries\s+3\.0k tok\s+1 call · 40\.0s end to end$/m, summary);
+		// The summary's 75 tok/s is a wall-clock average over a prefill, so it is
+		// nowhere in the rates, and the report says why it is missing.
+		assert.match(summary, /throughput {2}100 tok\/s .* peak 100 tok\/s/, summary);
+		assert.match(summary, /^ {2}summarization is timed end to end/m, summary);
+	});
+
 	it("reports records it could not time", () => {
 		const model = new SessionRateModel();
 		model.mergeRecord({ tokens: 53, elapsedMs: 1, peakRate: 0, exact: true });

@@ -18,6 +18,12 @@
  * Every measured message is appended to the session, so statistics cover the
  * whole session across `/reload`, `/resume`, forks, and branch switches.
  *
+ * pi summarizes in two places — `/compact` and the summary offered when `/tree`
+ * leaves a branch — and both call the model outside the agent loop, so nothing
+ * streams and no rate can be watched. Their wait is timed and their output
+ * counted, but the window measures prefill and queueing rather than generation,
+ * so they are reported on their own row and kept out of every rate.
+ *
  * Commands, with the default bracketed:
  *   /token-rate                        toggle the display
  *   /token-rate on|off                 enable or disable it
@@ -32,7 +38,7 @@
 
 import type { ExtensionAPI, ExtensionContext, ExtensionWidgetOptions } from "@earendil-works/pi-coding-agent";
 
-import { type MessageRecord, SessionRateModel } from "./metrics.ts";
+import { type MessageRecord, SessionRateModel, type SummaryKind } from "./metrics.ts";
 import { DETAIL_LEVELS, type DetailLevel, RateView, type StyleFn, visibleWidth } from "./rate-view.ts";
 
 /** Entry type for the rate records appended to the session. */
@@ -54,8 +60,13 @@ interface RateRecordEntry {
 	exact: boolean;
 	/** Present when the time to first token was measured from the turn start. */
 	ttftFrom?: "turn";
-	/** Present when the record is a compaction summary rather than a reply. */
-	kind?: "compaction";
+	/**
+	 * Present when the provider buffered the response before any of it was
+	 * written. Only the truthy case is stored, so the flag costs a byte.
+	 */
+	frontLoadedFirstChunk?: boolean;
+	/** Present when the record is a summarization call rather than a reply. */
+	kind?: SummaryKind;
 }
 
 /** Where the line sits relative to the editor. */
@@ -182,6 +193,21 @@ export default function tokenRate(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Stop claiming a summarization that pi says has ended.
+	 *
+	 * Compaction always ends in `session_compact` or `session_compact_failed`, but
+	 * an aborted branch summary ends in neither: `navigateTree` returns without
+	 * `session_tree`, so nothing is left to close the claim but this extension's own
+	 * bookkeeping. `ctx.isIdle()` is pi's own answer to "is anything running", and
+	 * it covers an agent run, a compaction, a branch summary, a retry and queued
+	 * work alike — so a call is claimed only while pi agrees that it is. The model
+	 * keeps the timing either way, so an errant frame costs a line, never a record.
+	 */
+	function syncSilentCall(ctx: ExtensionContext): void {
+		if (state.model.isSummarizing && ctx.isIdle()) state.model.noteSilentCallEnded();
+	}
+
+	/**
 	 * Publish the widget. The component reads the view on every frame, so a
 	 * session replacement only needs the widget rebuilt, not a new closure over
 	 * stale state.
@@ -197,6 +223,9 @@ export default function tokenRate(pi: ExtensionAPI) {
 		ctx.ui.setWidget(
 			WIDGET_KEY,
 			(_tui, theme) => {
+				// The frame is the only place that runs without an event to react to,
+				// which is where a summary that ended without one has to be noticed.
+				syncSilentCall(ctx);
 				const style: StyleFn = (color, text) => theme.fg(color, text);
 				return {
 					render: (width: number) => state.view.widgetLines(width, { style, now: Date.now(), measure: visibleWidth }),
@@ -212,6 +241,7 @@ export default function tokenRate(pi: ExtensionAPI) {
 	function render(force: boolean): void {
 		const ctx = state.ctx;
 		if (ctx?.mode !== "tui") return;
+		syncSilentCall(ctx);
 		const now = Date.now();
 		if (!force && now - state.lastRenderAt < RENDER_INTERVAL_MS) return;
 		state.lastRenderAt = now;
@@ -321,6 +351,26 @@ export default function tokenRate(pi: ExtensionAPI) {
 	// wait rather than generation, so it contributes no record.
 	pi.on("session_compact_failed", async () => {
 		state.model.endSilentCall(Date.now());
+		render(true);
+	});
+
+	// Branch summarization is the same shape as compaction: pi calls the model
+	// directly, so nothing streams to extensions and the only measurement is the
+	// end-to-end time around the provider's reported usage. A navigation that asks
+	// for no summary is instant and never calls the model, so it opens no call.
+	pi.on("session_before_tree", async (event) => {
+		// The handler must return nothing: pi reads any value back as a summary to
+		// inject, or as instructions to override.
+		if (!event.preparation.userWantsSummary) return;
+		state.model.beginSilentCall("branch-summary", Date.now());
+		render(true);
+	});
+
+	pi.on("session_tree", async (event) => {
+		// Fires for every navigation, with the summary entry only when one was
+		// generated. Without a summary the call closes here and records nothing.
+		const record = state.model.endSilentCall(Date.now(), event.summaryEntry?.usage?.output);
+		if (record) pi.appendEntry(RECORD_ENTRY_TYPE, toEntry(record));
 		render(true);
 	});
 
@@ -519,9 +569,16 @@ function readPersistedRecords(ctx: ExtensionContext): MessageRecord[] {
 			// in with the current definition.
 			ttftMs: data.ttftFrom === "turn" && typeof data.ttftMs === "number" ? data.ttftMs : undefined,
 			ttftFrom: data.ttftFrom,
+			// A buffered response has to stay out of the peak and the spread across a
+			// reload too: the record that is read back has to be the record that was
+			// written, or the rate it was held back from reappears with no caveat.
+			frontLoadedFirstChunk: data.frontLoadedFirstChunk === true ? true : undefined,
 			peakRate: 0,
 			exact: data.exact === true,
-			kind: data.kind,
+			// An unknown kind is dropped rather than trusted: the session file is
+			// writable data, and a record that cannot be identified is not one this
+			// version knows how to keep out of the rates.
+			kind: data.kind === "compaction" || data.kind === "branch-summary" ? data.kind : undefined,
 		});
 	}
 	return records;
@@ -551,6 +608,7 @@ function toEntry(record: MessageRecord): RateRecordEntry {
 		...(record.ttftMs === undefined ? {} : { ttftMs: record.ttftMs }),
 		exact: record.exact,
 		...(record.ttftFrom === undefined ? {} : { ttftFrom: record.ttftFrom }),
+		...(record.frontLoadedFirstChunk ? { frontLoadedFirstChunk: true } : {}),
 		...(record.kind === undefined ? {} : { kind: record.kind }),
 	};
 }

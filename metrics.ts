@@ -219,6 +219,15 @@ export function formatRateSegment(tokensPerSecond: number, exact: boolean): stri
 	return exact ? rate : `~${rate}`;
 }
 
+/**
+ * Which summarization call produced a record.
+ *
+ * pi summarizes in two places: context compaction, and the summary offered when
+ * `/tree` navigates away from a branch. Both are a real model call whose output
+ * never streams to extensions, so neither can be watched while it runs.
+ */
+export type SummaryKind = "compaction" | "branch-summary";
+
 /** One measured assistant message. */
 export interface MessageRecord {
 	/** Output tokens: provider-reported when available, else calibrated estimate. */
@@ -234,11 +243,11 @@ export interface MessageRecord {
 	/** True when the first delta already carried a sizeable chunk. */
 	frontLoadedFirstChunk?: boolean;
 	/**
-	 * What produced the record. A compaction summary is a model call whose
+	 * What produced the record. A summarization call is a model call whose
 	 * output never streams to extensions, so it is timed but has no live rate
 	 * and no measurable time to first token.
 	 */
-	kind?: "compaction";
+	kind?: SummaryKind;
 	/**
 	 * What the time to first token was measured from. Records from earlier
 	 * versions used the provider's stream-open event, which is a different and
@@ -262,13 +271,17 @@ export interface SessionRateLive {
 	/** Tokens produced so far by the message in flight, 0 when idle. */
 	messageTokens: number;
 	/** What the session is doing right now. */
-	activity: "idle" | "streaming" | "compacting";
+	activity: "idle" | "streaming" | "summarizing";
 	/** Elapsed time of a call that does not stream, 0 otherwise. */
 	silentElapsedMs: number;
 }
 
 export interface SessionRateStats {
-	/** Messages recorded, including records merged from session history. */
+	/**
+	 * Assistant replies recorded, including records merged from session history.
+	 * Summarization calls are not replies and are counted on their own, so every
+	 * rate and average below describes the same population.
+	 */
 	messages: number;
 	/** Output tokens across every record, including unmeasured ones. */
 	totalTokens: number;
@@ -315,13 +328,19 @@ export interface SessionRateStats {
 	 * is what a typical reply achieved; the fastest is the peak.
 	 */
 	rateSpread: { slowest: number; median: number; fastest: number };
-	/** Compaction summaries included in the totals. */
-	compactionMessages: number;
-	/** Output tokens those compaction summaries produced. */
-	compactionTokens: number;
-	/** True when every measured message had provider-reported usage. */
+	/**
+	 * Summarization calls recorded: context compactions and branch summaries.
+	 * They contribute tokens to `totalTokens` and nothing else, because their
+	 * window is prefill and queueing rather than tokens arriving.
+	 */
+	summaryMessages: number;
+	/** Output tokens those summarization calls produced. */
+	summaryTokens: number;
+	/** Total wall-clock time those calls took from start to finish. */
+	summaryElapsedMs: number;
+	/** True when every recorded call had provider-reported usage. */
 	allExact: boolean;
-	/** True when at least one message was measured. */
+	/** True when anything at all was recorded, summaries included. */
 	hasData: boolean;
 }
 
@@ -385,8 +404,15 @@ export class SessionRateModel {
 	private traceScale = 0;
 
 	/** A model call whose output does not stream to extensions, such as compaction. */
-	private silentKind: "compaction" | undefined;
+	private silentKind: SummaryKind | undefined;
 	private silentStart = 0;
+	/**
+	 * Whether the open silent call is still believed to be running.
+	 *
+	 * Separate from the bookkeeping above on purpose: believing a call is over
+	 * must never be what loses its measurement.
+	 */
+	private silentRunning = false;
 	private messageActive = false;
 	private messageStart = 0;
 	/** Cached statistics, invalidated whenever a record is added or cleared. */
@@ -424,6 +450,7 @@ export class SessionRateModel {
 		this.messageFirstTokenAt = undefined;
 		this.messageLastTokenAt = undefined;
 		this.silentKind = undefined;
+		this.silentRunning = false;
 	}
 
 	get calibrationFactor(): number {
@@ -498,31 +525,43 @@ export class SessionRateModel {
 			tokens: this.tokens,
 			peak: this.peak,
 			messageTokens: this.messageActive ? this.tokens - this.messageStartTokens : 0,
-			activity: this.silentKind === "compaction" ? "compacting" : this.messageActive ? "streaming" : "idle",
+			activity: this.isSummarizing ? "summarizing" : this.messageActive ? "streaming" : "idle",
 			// A call that does not stream can only be timed from end to end.
-			silentElapsedMs: this.silentKind === undefined ? 0 : Math.max(0, now - this.silentStart),
+			silentElapsedMs: this.isSummarizing ? Math.max(0, now - this.silentStart) : 0,
 		};
+	}
+
+	/**
+	 * True while the line is claiming to be waiting on a call that does not stream.
+	 * A call whose end nobody reported is not claimed: see
+	 * {@link noteSilentCallEnded}.
+	 */
+	get isSummarizing(): boolean {
+		return this.silentKind !== undefined && this.silentRunning;
 	}
 
 	/**
 	 * Start tracking a model call whose output does not stream to extensions.
 	 *
-	 * Compaction is the only such call pi reports: it invokes the model directly
-	 * instead of running the agent loop, so no message events are emitted and
-	 * nothing about it can be measured while it runs.
+	 * Compaction and branch summarization are the only such calls pi reports: both
+	 * invoke the model directly instead of running the agent loop, so no message
+	 * events are emitted and nothing about them can be measured while they run.
 	 */
-	beginSilentCall(kind: "compaction", now: number): void {
+	beginSilentCall(kind: SummaryKind, now: number): void {
 		this.silentKind = kind;
 		this.silentStart = now;
+		this.silentRunning = true;
 	}
 
 	/**
 	 * Finish such a call. The elapsed time covers the wait as well as the
-	 * generation, so the resulting rate is an average over the whole call and
-	 * understates the generation speed; the wait is exactly what the user spent.
+	 * generation, so it is an end-to-end measurement rather than a generation
+	 * speed; the wait is exactly what the user spent, and the record is kept out
+	 * of every rate for that reason.
 	 */
 	endSilentCall(now: number, reportedTokens?: number): MessageRecord | undefined {
 		if (this.silentKind === undefined) return undefined;
+		const kind = this.silentKind;
 		this.silentKind = undefined;
 		if (reportedTokens === undefined || reportedTokens <= 0) return undefined;
 		const record: MessageRecord = {
@@ -530,10 +569,28 @@ export class SessionRateModel {
 			elapsedMs: Math.max(0, now - this.silentStart),
 			peakRate: 0,
 			exact: true,
-			kind: "compaction",
+			kind,
 		};
 		this.mergeRecord(record);
 		return record;
+	}
+
+	/**
+	 * Stop claiming that an open silent call is running, without forgetting it.
+	 *
+	 * pi does not emit a terminal event for every way a summarization can end:
+	 * `navigateTree` returns without `session_tree` when the user aborts the
+	 * summary, so the line would otherwise wait on a call that has already ended.
+	 * A second opinion from pi closes the claim.
+	 *
+	 * The timing is kept, not discarded: the terminal event is what turns a call
+	 * into a record, and if pi's own state were ever briefly wrong, the usage that
+	 * arrives with that event still has to be counted rather than thrown away with
+	 * the claim. A call that really was aborted reports no usage and records
+	 * nothing, which is the outcome either way.
+	 */
+	noteSilentCallEnded(): void {
+		this.silentRunning = false;
 	}
 
 	/**
@@ -579,6 +636,7 @@ export class SessionRateModel {
 	 */
 	beginMessage(now: number, ttftFrom?: number): void {
 		this.silentKind = undefined;
+		this.silentRunning = false;
 		this.messageActive = true;
 		this.messageStart = now;
 		// A reference at or before zero means the caller had nothing to offer, so
@@ -701,14 +759,31 @@ export class SessionRateModel {
 		const bufferedRates: number[] = [];
 		let bufferedTokens = 0;
 		let bufferedMs = 0;
-		let compactionMessages = 0;
-		let compactionTokens = 0;
+		let summaryMessages = 0;
+		let summaryTokens = 0;
+		let summaryElapsedMs = 0;
 		let ttftSum = 0;
 		let ttftCount = 0;
 		let allExact = this.records.length > 0;
 
 		for (const record of this.records) {
 			totalTokens += record.tokens;
+			if (!record.exact) allExact = false;
+
+			// A summarization call is a real model call and its output is real, but
+			// its window is prefill, queueing and retries rather than tokens arriving
+			// at the speed the model produced them. Admitting it would let one
+			// end-to-end wall time stand in for a generation speed: a slow summary
+			// would drag the session average down, and a fast one would hold the
+			// peak for the rest of the session. It is counted apart instead, and
+			// every rate below describes replies only.
+			if (record.kind !== undefined) {
+				summaryMessages++;
+				summaryTokens += record.tokens;
+				summaryElapsedMs += Math.max(0, record.elapsedMs);
+				continue;
+			}
+
 			if (record.frontLoadedFirstChunk) frontLoadedMessages++;
 			// Only records measured from the same reference are comparable: earlier
 			// versions timed from the provider's stream-open event, which is not the
@@ -716,11 +791,6 @@ export class SessionRateModel {
 			if (record.ttftFrom === "turn" && record.ttftMs !== undefined && record.ttftMs > 0) {
 				ttftSum += record.ttftMs;
 				ttftCount++;
-			}
-			if (!record.exact) allExact = false;
-			if (record.kind === "compaction") {
-				compactionMessages++;
-				compactionTokens += record.tokens;
 			}
 
 			// A window this short carries no rate information, so the record
@@ -767,7 +837,7 @@ export class SessionRateModel {
 		const middle = messageRates.length >> 1;
 
 		return {
-			messages: this.records.length,
+			messages: this.records.length - summaryMessages,
 			totalTokens,
 			measuredMessages,
 			unmeasuredMessages,
@@ -789,8 +859,9 @@ export class SessionRateModel {
 							: (messageRates[middle - 1] + messageRates[middle]) / 2,
 				fastest: messageRates[messageRates.length - 1] ?? 0,
 			},
-			compactionMessages,
-			compactionTokens,
+			summaryMessages,
+			summaryTokens,
+			summaryElapsedMs,
 			allExact,
 			hasData: this.records.length > 0,
 		};

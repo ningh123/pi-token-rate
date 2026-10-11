@@ -24,7 +24,8 @@ on one adaptive line above the editor:
   its last shape and the number decays smoothly instead of resetting.
 - **Whole-session statistics.** Every measured message is appended to the session,
   so the numbers cover the whole session across `/reload`, `/resume`, forks, and
-  branch switches.
+  branch switches. Compactions and branch summaries are timed and counted on a
+  row of their own, never folded into a rate.
 - **Honest numbers.** Live values are estimated from streamed deltas and marked
   with `~` until the provider reports `usage.output`.
 
@@ -38,7 +39,7 @@ on one adaptive line above the editor:
 | `/token-rate detail minimal` / `compact` / `[full]` | How much to show, as a prefix of the detail list above; a narrow terminal trims further |
 | `/token-rate tick 250ms` / `500ms` / `1s` / `[2s]` | Width of one trace bar |
 | `/token-rate window 8s` / `16s` / `[32s]` / `60s` | Time the trace covers; the bar count follows |
-| `/token-rate stats` | Session report: output, generation time, throughput, rate spread, time to first token, the trace, and any caveats |
+| `/token-rate stats` | Session report: output, generation time, throughput, rate spread, time to first token, any summarization calls, the trace, and any caveats |
 | `/token-rate reset` | Clear the statistics for this run |
 | `/token-rate help` | List every option with the current state |
 
@@ -109,6 +110,25 @@ Only model output counts. The tokens a model spends writing a tool call are
 counted, because they are output tokens; the tool's result is not, because it is
 input for the next request.
 
+## Summarization
+
+pi summarizes in two places: `/compact`, and the summary offered when `/tree`
+leaves a branch. Both call the model outside the agent loop, so no message events
+are emitted and nothing can be watched while they run. The line shows the wait
+(`⚡ ░ summarizing 12.4s`), and the provider's own `usage.output` times the call
+from start to finish, so both are measured.
+
+Those end-to-end windows are not generation windows: a summary reads a large
+context, and most of its time goes into prefill, queueing and retries. They are
+therefore counted apart, on a `summaries` row of their own, and kept out of
+`avg`, `peak`, `spread`, `generated` and the message count. Their tokens do count
+towards the session output, and they are stored, so a summary that ran before a
+`/reload` is still in the report. `/token-rate reset` clears them like anything
+else.
+
+A summary that never reports usage — a cancelled one, or a failed compaction — is
+not recorded at all: there is no output to count and no generation to time.
+
 `peak` is the fastest average rate of any single message, recomputed from stored
 tokens and generation time, so it is identical before and after a reload. A
 response the provider **buffered** is held out of it: when the first delta already
@@ -130,9 +150,11 @@ Token rate · this session
    generated  19m09s            8.6k tok per minute
   throughput  144 tok/s         session average · now 151 tok/s · peak 744 tok/s
       spread  31 … 744 tok/s    median 175 tok/s
- first token  5.0s              31 of 202 messages timed
+ first token  5.0s              31 of 242 messages timed
+   summaries  6.4k tok          3 calls · 41.2s end to end
        trace  ▇█▇██▇█▇█▇█▇█▇█▇██▇█▇█▇█▇█▇█▇██▇  32 bars · 1.0s each · 32.0s span
   43 messages arrived faster than a frame: tokens counted, but no rate can be derived from them
+  summarization is timed end to end, so it counts towards the output but not towards the average, the peak or the spread
   rates marked ~ are estimated from stream deltas; the rest are provider-reported
 ```
 
@@ -198,7 +220,7 @@ breathes.
 | --- | --- |
 | `▁▂▃▄▅▆▇█` | A trace bar, from a stall to the fastest bar in the window |
 | `·` | A bar that has not arrived yet. The whole field is drawn before the first one, so the line never moves |
-| `░` | Drawn where the trace sits while a call that does not stream, such as a compaction, is running |
+| `░` | Drawn where the trace sits while a call that does not stream — a compaction or a branch summary — is running |
 | `~` | The number is estimated rather than provider-reported |
 | ` · ` | Separator between details |
 
