@@ -1,6 +1,6 @@
 {
   "name": "pi-token-rate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Session-wide output-token throughput for pi: live rate, sparkline, peak, and time to first token",
   "keywords": [
     "pi-package",
@@ -26,7 +26,8 @@
   "files": [
     "index.ts",
     "metrics.ts",
-    "rate-view.ts"
+    "rate-view.ts",
+    "CHANGELOG.md"
   ],
   "exports": {
     ".": "./index.ts"
