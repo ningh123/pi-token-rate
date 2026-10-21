@@ -786,3 +786,28 @@ describe("sparkline", () => {
 		assert.equal(sparkline([0, 0]), `${SPARK_CHARS[0]}${SPARK_CHARS[0]}`);
 	});
 });
+
+describe("child usage", () => {
+	it("is held as a snapshot of the latest report, apart from every statistic", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord({ tokens: 400, elapsedMs: 4000, ttftMs: 500, ttftFrom: "turn", peakRate: 0, exact: true });
+		const before = model.stats;
+		model.setChildren({ output: 34_000, input: 120_000, cacheRead: 90_000, children: 3, unresolved: 1 });
+		assert.equal(model.children?.output, 34_000);
+		assert.equal(model.children?.unresolved, 1);
+		// Child tokens are accounting, not output of this session's own stream:
+		// nothing in the statistics moves when a report arrives.
+		assert.deepEqual(model.stats, before);
+		// A later report replaces the earlier one wholesale, because the walk
+		// covers whatever branch is current and a switch can lower it.
+		model.setChildren({ output: 12_000, input: 0, cacheRead: 0, children: 1, unresolved: 0 });
+		assert.equal(model.children?.output, 12_000);
+	});
+
+	it("is cleared by reset, like every other aggregate of the run", () => {
+		const model = new SessionRateModel();
+		model.setChildren({ output: 34_000, input: 0, cacheRead: 0, children: 3, unresolved: 0 });
+		model.reset();
+		assert.equal(model.children, undefined);
+	});
+});

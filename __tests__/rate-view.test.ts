@@ -41,6 +41,7 @@ function snapshot(overrides: Partial<RateViewSnapshot> = {}): RateViewSnapshot {
 		activity: "idle",
 		silentElapsedMs: 0,
 		traceSlots: 32,
+		children: undefined,
 		...overrides,
 	};
 }
@@ -513,5 +514,67 @@ describe("minimum rate window", () => {
 		model.mergeRecord({ tokens: 1200, elapsedMs: 19_900, peakRate: 60, exact: true });
 		const report = new RateView(model).summary(NOW);
 		assert.doesNotMatch(report, /rather than the model that wrote it/, report);
+	});
+});
+
+describe("subagent children", () => {
+	const children = (output: number, count = 2, unresolved = 0) => ({ output, children: count, lowerBound: unresolved > 0 });
+
+	it("shows cumulative child output after the session totals it belongs beside", () => {
+		const line = render(snapshot({ children: children(34_000) }), 120)[0] ?? "";
+		assert.match(line, /ttft 0\.8s · sub 34k tok · avg /, line);
+	});
+
+	it("marks a lower bound with a plus, and nothing when no child ran", () => {
+		assert.match(render(snapshot({ children: children(34_000, 2, 1) }), 120)[0] ?? "", /sub 34k\+ tok/);
+		assert.doesNotMatch(render(snapshot(), 120)[0] ?? "", /sub /);
+	});
+
+	it("survives a narrower terminal longer than the aggregates it outranks", () => {
+		// The segment sits before avg, peak and total in importance, so a width
+		// that has given those up still shows it — and one that drops it keeps ttft.
+		const keep = render(snapshot({ children: children(34_000) }), 84)[0] ?? "";
+		assert.match(keep, /sub 34k tok/, keep);
+		const drop = render(snapshot({ children: children(34_000) }), 68)[0] ?? "";
+		assert.doesNotMatch(drop, /sub /, drop);
+		assert.match(drop, /ttft/, drop);
+	});
+
+	it("stays on the line while the parent streams, because children run in parallel", () => {
+		const line =
+			render(
+				snapshot({ children: children(34_000), activity: "streaming", messageTokens: 400, messageElapsedMs: 6400 }),
+				120,
+			)[0] ?? "";
+		assert.match(line, /sub 34k tok/, line);
+	});
+
+	it("reports the children on their own row, apart from every rate", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord(record());
+		model.setChildren({ output: 34_000, input: 120_000, cacheRead: 90_000, children: 3, unresolved: 0 });
+		const report = new RateView(model).summary(NOW);
+		assert.match(report, /children {2}34k tok\s+3 subagents · parallel output, never in the rates above/, report);
+		assert.match(report, /never enters a rate/, report);
+		// The parent's own account is untouched by the child tokens.
+		assert.match(report, /output {2}400 tok\s+1 message/, report);
+		assert.doesNotMatch(report, /lower bound/, report);
+	});
+
+	it("carries the lower-bound caveat only when a run could not be read", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord(record());
+		model.setChildren({ output: 34_000, input: 0, cacheRead: 0, children: 3, unresolved: 2 });
+		const report = new RateView(model).summary(NOW);
+		assert.match(report, /children {2}34k\+ tok/, report);
+		assert.match(report, /lower bound/, report);
+	});
+
+	it("draws no segment and no row for a session that ran no children", () => {
+		const model = new SessionRateModel();
+		model.mergeRecord(record());
+		model.setChildren({ output: 0, input: 0, cacheRead: 0, children: 0, unresolved: 0 });
+		const report = new RateView(model).summary(NOW);
+		assert.doesNotMatch(report, /children/, report);
 	});
 });

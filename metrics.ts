@@ -228,6 +228,31 @@ export function formatRateSegment(tokensPerSecond: number, exact: boolean): stri
  */
 export type SummaryKind = "compaction" | "branch-summary";
 
+/**
+ * Cumulative usage of the subagent children this session has run.
+ *
+ * A child is its own pi session: its messages never reach this session's event
+ * bus, so nothing about it can be measured while it runs. What pi-subagents
+ * reports instead is accounting — the tokens every finished child consumed —
+ * read at a turn boundary, which is why this is a snapshot rather than a
+ * record: it has no window, and no rate can be derived from it.
+ */
+export interface ChildUsageSnapshot {
+	/** Cumulative output tokens across every counted child. */
+	output: number;
+	/** Cumulative input tokens across every counted child. */
+	input: number;
+	/** Cumulative cache-read tokens across every counted child. */
+	cacheRead: number;
+	/** Children whose usage was counted. */
+	children: number;
+	/**
+	 * Async children whose usage could not be read, so every total above is a
+	 * lower bound rather than a complete account.
+	 */
+	unresolved: number;
+}
+
 /** One measured assistant message. */
 export interface MessageRecord {
 	/** Output tokens: provider-reported when available, else calibrated estimate. */
@@ -428,6 +453,8 @@ export class SessionRateModel {
 	private messagePeak = 0;
 
 	private records: MessageRecord[] = [];
+	/** Latest cumulative child-subagent usage, replaced wholesale at each report. */
+	private childUsage: ChildUsageSnapshot | undefined;
 
 	constructor(options: SessionRateOptions = {}) {
 		this.tau = options.smoothingMs ?? DEFAULT_SMOOTHING_MS;
@@ -726,6 +753,22 @@ export class SessionRateModel {
 	}
 
 	/**
+	 * Latest child-subagent usage, when pi-subagents has reported any.
+	 *
+	 * The report walks the current session branch, so it is adopted as-is rather
+	 * than merged: a branch switch can legitimately lower it, exactly as it
+	 * changes which parent records the statistics are seeded from.
+	 */
+	get children(): ChildUsageSnapshot | undefined {
+		return this.childUsage;
+	}
+
+	/** Adopt the latest cumulative child-subagent usage for this session. */
+	setChildren(usage: ChildUsageSnapshot | undefined): void {
+		this.childUsage = usage;
+	}
+
+	/**
 	 * Add a record recovered from session history, so statistics cover the whole
 	 * session even across reloads and resumes.
 	 */
@@ -867,9 +910,10 @@ export class SessionRateModel {
 		};
 	}
 
-	/** Clear aggregates, including merged history, and restart the live series. */
+	/** Clear aggregates, including merged history and child usage, and restart the live series. */
 	reset(): void {
 		this.records = [];
+		this.childUsage = undefined;
 		this.statsCache = undefined;
 		this.begin(Date.now());
 	}

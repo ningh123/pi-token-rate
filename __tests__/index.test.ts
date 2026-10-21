@@ -31,6 +31,8 @@ interface Harness {
 	branch: unknown[];
 	/** Prefs entries appended by the extension. */
 	prefs: { type: string; data: unknown }[];
+	/** Requests captured on the pi-subagents RPC channel, oldest first. */
+	rpcRequests: { requestId: string; method: string }[];
 	ctx: unknown;
 	/**
 	 * What `ctx.isIdle()` answers: whether pi has an agent run, a compaction, a
@@ -39,6 +41,10 @@ interface Harness {
 	 */
 	setIdle(idle: boolean): void;
 	emit(event: string, payload?: unknown): Promise<void>;
+	/** Deliver an event-bus message the way another extension would. */
+	busEmit(channel: string, data?: unknown): void;
+	/** Answer the newest cost request the way pi-subagents would. */
+	answerCost(report: unknown): void;
 	command(args?: string): Promise<void>;
 	completions(prefix: string): { value: string; label: string; description?: string }[] | null;
 	/** Visible text of the installed widget. */
@@ -56,7 +62,7 @@ const theme = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function createHarness(options: { mode?: "tui" | "print" } = {}): Harness {
+function createHarness(options: { mode?: "tui" | "print"; events?: boolean } = {}): Harness {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, RegisteredCommand>();
 	const widgets: (WidgetFactory | undefined)[] = [];
@@ -64,9 +70,34 @@ function createHarness(options: { mode?: "tui" | "print" } = {}): Harness {
 	const appended: { type: string; data: unknown }[] = [];
 	const branch: unknown[] = [];
 	const prefs: { type: string; data: unknown }[] = [];
+	const rpcRequests: { requestId: string; method: string }[] = [];
+	const busHandlers = new Map<string, ((data: unknown) => void)[]>();
 	const harness = { placement: undefined as string | undefined };
+	const bus =
+		options.events === false
+			? undefined
+			: {
+					emit(channel: string, data: unknown) {
+						if (channel === "subagents:rpc:v1:request") {
+							const request = data as { requestId?: string; method?: string };
+							if (request?.requestId) rpcRequests.push({ requestId: request.requestId, method: request.method ?? "" });
+						}
+						for (const handler of busHandlers.get(channel) ?? []) handler(data);
+					},
+					on(channel: string, handler: (data: unknown) => void) {
+						const list = busHandlers.get(channel) ?? [];
+						list.push(handler);
+						busHandlers.set(channel, list);
+						return () => {
+							const remaining = busHandlers.get(channel) ?? [];
+							const index = remaining.indexOf(handler);
+							if (index >= 0) remaining.splice(index, 1);
+						};
+					},
+				};
 
 	const pi = {
+		events: bus,
 		on(event: string, handler: Handler) {
 			const list = handlers.get(event) ?? [];
 			list.push(handler);
@@ -135,6 +166,7 @@ function createHarness(options: { mode?: "tui" | "print" } = {}): Harness {
 		appended,
 		branch,
 		prefs,
+		rpcRequests,
 		get placement() {
 			return harness.placement;
 		},
@@ -144,6 +176,20 @@ function createHarness(options: { mode?: "tui" | "print" } = {}): Harness {
 		ctx,
 		async emit(event: string, payload: unknown = {}) {
 			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		},
+		busEmit(channel: string, data: unknown = {}) {
+			bus?.emit(channel, data);
+		},
+		answerCost(report: unknown) {
+			const request = rpcRequests[rpcRequests.length - 1];
+			assert.ok(request, "a cost request was sent");
+			bus?.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+				version: 1,
+				requestId: request.requestId,
+				method: "cost",
+				success: true,
+				data: report,
+			});
 		},
 		async command(args = "") {
 			const command = commands.get("token-rate");
@@ -978,5 +1024,137 @@ describe("lifecycle and commands", () => {
 		const help = harness.notifications.at(-1) ?? "";
 		assert.match(help, /state {4}off/, help);
 		assert.doesNotMatch(help, /live ·/, help);
+	});
+});
+
+describe("subagent children", () => {
+	/** A cost report shaped like pi-subagents', with `output` tokens per child. */
+	function costReport(output: number, count = 2, unresolved = 0) {
+		return {
+			version: 1,
+			parent: { input: 1000, output: 400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			children: Array.from({ length: count }, () => ({
+				label: "Child",
+				usage: { input: 10, output, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			})),
+			childTotal: { input: 10 * count, output: output * count, cacheRead: 0, cacheWrite: 0, cost: 0, turns: count },
+			total: { input: 1010, output: 400 + output * count, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 + count },
+			unresolvedAsyncChildren: unresolved,
+		};
+	}
+
+	/** A session with one measured reply, ready for a cost report. */
+	async function startedHarness(): Promise<Harness> {
+		const harness = createHarness();
+		await harness.emit("session_start", { reason: "startup" });
+		await harness.emit("turn_start", {});
+		await harness.emit("message_start", { message: { role: "assistant" } });
+		await stream(harness, 10, 5);
+		await harness.emit("message_end", completedMessage(400));
+		return harness;
+	}
+
+	it("asks pi-subagents for the accounting at startup and every turn boundary", async () => {
+		const harness = await startedHarness();
+		// session_start asked once already, ready re-asks even though that first
+		// request is still out — it was asked of a bridge that was not there to
+		// answer — and a settled turn asks again: the contract says turn
+		// boundaries, never a timer.
+		assert.equal(harness.rpcRequests.length, 1);
+		assert.equal(harness.rpcRequests[0].method, "cost");
+		harness.busEmit("subagents:rpc:v1:ready", { capabilities: { cost: { version: 1 } } });
+		assert.equal(harness.rpcRequests.length, 2);
+		// A request already out is not stacked by the next boundary: the walk is
+		// in flight, and its reply or its timeout closes it.
+		await harness.emit("agent_settled", {});
+		assert.equal(harness.rpcRequests.length, 2);
+		harness.answerCost({
+			version: 1,
+			parent: { input: 1000, output: 400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			children: [],
+			childTotal: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+			total: { input: 1000, output: 400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			unresolvedAsyncChildren: 0,
+		});
+		await harness.emit("agent_settled", {});
+		assert.equal(harness.rpcRequests.length, 3);
+	});
+
+	it("shows cumulative child output on its own segment and row", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagents:rpc:v1:ready", {});
+		harness.answerCost(costReport(17_000, 2));
+
+		const line = harness.line(120);
+		assert.match(line, /sub 34k tok/, line);
+		// The headline and the session rates still describe the parent alone.
+		assert.match(line, /400 tok/, line);
+
+		await harness.command("stats");
+		const summary = harness.notifications.at(-1) ?? "";
+		assert.match(summary, /children {2}34k tok\s+2 subagents · parallel output, never in the rates above/, summary);
+		assert.match(summary, /never enters a rate/, summary);
+		// The parent's own rows are untouched by the child tokens.
+		assert.match(summary, /output {2}400 tok\s+1 message/, summary);
+	});
+
+	it("marks the child output as a lower bound when a run could not be read", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagents:rpc:v1:ready", {});
+		harness.answerCost(costReport(17_000, 2, 1));
+
+		assert.match(harness.line(120), /sub 34k\+ tok/, harness.line(120));
+		await harness.command("stats");
+		const summary = harness.notifications.at(-1) ?? "";
+		assert.match(summary, /lower bound/, summary);
+	});
+
+	it("shows nothing when no child ran, and ignores failed replies", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagents:rpc:v1:ready", {});
+		harness.answerCost({
+			version: 1,
+			parent: { input: 1000, output: 400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			children: [],
+			childTotal: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+			total: { input: 1000, output: 400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			unresolvedAsyncChildren: 0,
+		});
+		assert.doesNotMatch(harness.line(120), /sub /, harness.line(120));
+
+		// A reply that failed, or data that cannot be identified, changes nothing.
+		const request = harness.rpcRequests[harness.rpcRequests.length - 1];
+		harness.busEmit(`subagents:rpc:v1:reply:${request.requestId}`, {
+			version: 1,
+			requestId: request.requestId,
+			method: "cost",
+			success: false,
+			error: { code: "execution_failed", message: "no artifacts" },
+		});
+		await harness.emit("agent_settled", {});
+		harness.busEmit("subagents:rpc:v1:ready", {});
+		harness.answerCost({ childTotal: { output: "many" } });
+		assert.doesNotMatch(harness.line(120), /sub /, harness.line(120));
+	});
+
+	it("keeps the segment while the parent streams, because children run in parallel", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagents:rpc:v1:ready", {});
+		harness.answerCost(costReport(17_000, 2));
+		await harness.emit("turn_start", {});
+		await harness.emit("message_start", { message: { role: "assistant" } });
+		await stream(harness, 4, 5);
+
+		const line = harness.line(120);
+		assert.match(line, /tok\/s/, line);
+		assert.match(line, /sub 34k tok/, line);
+	});
+
+	it("works without an event bus, as an older pi host would present itself", async () => {
+		const harness = createHarness({ events: false });
+		await harness.emit("session_start", { reason: "startup" });
+		await harness.emit("agent_settled", {});
+		assert.equal(harness.rpcRequests.length, 0);
+		await harness.emit("session_shutdown", {});
 	});
 });

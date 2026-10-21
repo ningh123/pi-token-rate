@@ -24,6 +24,12 @@
  * counted, but the window measures prefill and queueing rather than generation,
  * so they are reported on their own row and kept out of every rate.
  *
+ * Subagent children (pi-subagents) stream to their own sessions, so their
+ * output never reaches this session's events either. What is shown instead is
+ * the accounting pi-subagents exposes on the process event bus: cumulative
+ * child tokens, read at turn boundaries and drawn on a segment of its own —
+ * never inside a rate, for the same reason as a summary.
+ *
  * Commands, with the default bracketed:
  *   /token-rate                        toggle the display
  *   /token-rate on|off                 enable or disable it
@@ -36,9 +42,11 @@
  *   /token-rate help                   list every option with the current state
  */
 
+import { randomUUID } from "node:crypto";
+
 import type { ExtensionAPI, ExtensionContext, ExtensionWidgetOptions } from "@earendil-works/pi-coding-agent";
 
-import { type MessageRecord, SessionRateModel, type SummaryKind } from "./metrics.ts";
+import { type ChildUsageSnapshot, type MessageRecord, SessionRateModel, type SummaryKind } from "./metrics.ts";
 import { DETAIL_LEVELS, type DetailLevel, RateView, type StyleFn, visibleWidth } from "./rate-view.ts";
 
 /** Entry type for the rate records appended to the session. */
@@ -51,6 +59,20 @@ const WIDGET_KEY = "token-rate-spark";
 
 /** Minimum interval between renders while streaming. */
 const RENDER_INTERVAL_MS = 80;
+
+/** pi-subagents' in-process RPC channels, used to read child-subagent usage. */
+const SUBAGENT_RPC_READY = "subagents:rpc:v1:ready";
+const SUBAGENT_RPC_REQUEST = "subagents:rpc:v1:request";
+const subagentRpcReply = (requestId: string) => `subagents:rpc:v1:reply:${requestId}`;
+
+/**
+ * Longest wait for a cost reply before the request is given up as unanswered.
+ *
+ * The report walks session entries and run artifacts on disk, so the wait is
+ * generous rather than fast; an unanswered request costs nothing but a timer,
+ * because the next turn boundary asks again.
+ */
+const COST_TIMEOUT_MS = 3000;
 
 /** One measured message as stored in the session. */
 interface RateRecordEntry {
@@ -166,6 +188,8 @@ interface SessionState {
 	/** When the previous message or tool call finished. */
 	lastStepEndedAt: number;
 	lastRenderAt: number;
+	/** Subscriptions on the extension event bus, released when the session ends. */
+	busSubscriptions: (() => void)[];
 }
 
 export default function tokenRate(pi: ExtensionAPI) {
@@ -180,6 +204,7 @@ export default function tokenRate(pi: ExtensionAPI) {
 		turnStartedAt: 0,
 		lastStepEndedAt: 0,
 		lastRenderAt: 0,
+		busSubscriptions: [],
 	};
 
 	/** Replace the model, e.g. after seeding it from session history. */
@@ -248,6 +273,60 @@ export default function tokenRate(pi: ExtensionAPI) {
 		renderWidget(ctx);
 	}
 
+	/** The cost request currently out, when one is. */
+	let costOut: { unsubscribe: () => void; cancelTimer: () => void } | undefined;
+
+	/** Drop the outstanding cost request without waiting for its reply or timeout. */
+	function releaseCostRequest(): void {
+		const out = costOut;
+		costOut = undefined;
+		if (!out) return;
+		out.cancelTimer();
+		out.unsubscribe();
+	}
+
+	/**
+	 * Ask pi-subagents for this session's parent-plus-child token accounting.
+	 *
+	 * A child is its own pi session, so nothing about it streams to this
+	 * extension: the cost report is the supported accounting view, and it is read
+	 * on turn boundaries rather than on a timer, exactly as its contract asks.
+	 * An unanswered request — pi-subagents not installed, or not ready yet —
+	 * simply tries again at the next boundary. A readiness notice forces a fresh
+	 * request, because whatever was asked before it was asked of a bridge that
+	 * was not there to answer.
+	 */
+	function requestChildUsage(force = false): void {
+		const bus = pi.events;
+		if (!bus) return;
+		if (costOut && !force) return;
+		releaseCostRequest();
+		const requestId = randomUUID();
+		const unsubscribe = bus.on(subagentRpcReply(requestId), (raw) => {
+			releaseCostRequest();
+			const usage = parseChildUsageReport(raw);
+			if (usage === undefined) return;
+			state.model.setChildren(usage);
+			render(true);
+		});
+		const timer = setTimeout(() => releaseCostRequest(), COST_TIMEOUT_MS);
+		costOut = { unsubscribe, cancelTimer: () => clearTimeout(timer) };
+		bus.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: "cost" });
+	}
+
+	/**
+	 * Listen for pi-subagents' readiness notice, which also arrives after a
+	 * `/reload` of either extension. The subscription outlives session switches,
+	 * so it is re-armed rather than stacked: `session_start` fires for every
+	 * session the process opens.
+	 */
+	function subscribeSubagentRpc(): void {
+		const bus = pi.events;
+		if (!bus) return;
+		for (const unsubscribe of state.busSubscriptions.splice(0)) unsubscribe();
+		state.busSubscriptions.push(bus.on(SUBAGENT_RPC_READY, () => requestChildUsage(true)));
+	}
+
 	/**
 	 * Point the trace at the configured resolution. The bar count follows from
 	 * the tick and the window, so the pair always describes a real time span.
@@ -276,6 +355,12 @@ export default function tokenRate(pi: ExtensionAPI) {
 		setModel(model);
 		state.lastRenderAt = 0;
 		render(true);
+		// The bus subscription is process-wide but the model is per session, so it
+		// is re-armed here and a fresh report is asked for: pi-subagents may have
+		// loaded before or after this extension, and its report walks whatever
+		// branch is current, which also restores the numbers after a `/reload`.
+		subscribeSubagentRpc();
+		requestChildUsage();
 	});
 
 	pi.on("turn_start", async () => {
@@ -377,6 +462,9 @@ export default function tokenRate(pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_event, ctx) => {
 		state.ctx = ctx;
 		state.model.observe(Date.now());
+		// A settled agent is the turn boundary the cost report asks to be read on:
+		// children that finished during the turn are counted without a timer.
+		requestChildUsage();
 		render(true);
 	});
 
@@ -387,6 +475,8 @@ export default function tokenRate(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		state.ctx = undefined;
+		releaseCostRequest();
+		for (const unsubscribe of state.busSubscriptions.splice(0)) unsubscribe();
 	});
 
 	pi.registerCommand("token-rate", {
@@ -625,4 +715,49 @@ function deltaText(event: { type: string; delta?: string }): string | undefined 
 function outputTokens(message: unknown): number | undefined {
 	const usage = (message as { usage?: { output?: number } } | null)?.usage;
 	return typeof usage?.output === "number" ? usage.output : undefined;
+}
+
+/** True when the value is a record and not an array or `null`. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A finite non-negative number, or undefined: the bus carries writable data. */
+function nonNegativeNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * One field of a usage block, defaulting to zero rather than rejecting the
+ * report: a field pi-subagents did not write is an absence, not a corruption.
+ */
+function usageField(block: Record<string, unknown> | undefined, field: string): number {
+	return nonNegativeNumber(block?.[field]) ?? 0;
+}
+
+/**
+ * Read a child-usage snapshot out of a `cost` reply.
+ *
+ * The reply is data from another extension on the process event bus, so it is
+ * validated the way session entries are: a report that cannot be identified is
+ * not one this version knows how to count. An account with nothing in it is
+ * returned as undefined, so a session that ran no children draws no segment.
+ */
+function parseChildUsageReport(reply: unknown): ChildUsageSnapshot | undefined {
+	if (!isRecord(reply) || reply.success !== true) return undefined;
+	const data = reply.data;
+	if (!isRecord(data)) return undefined;
+	const childTotal = isRecord(data.childTotal) ? data.childTotal : undefined;
+	const output = nonNegativeNumber(childTotal?.output);
+	if (output === undefined) return undefined;
+	const children = Array.isArray(data.children) ? data.children.length : 0;
+	const unresolved = nonNegativeNumber(data.unresolvedAsyncChildren) ?? 0;
+	if (output === 0 && children === 0 && unresolved === 0) return undefined;
+	return {
+		output,
+		input: usageField(childTotal, "input"),
+		cacheRead: usageField(childTotal, "cacheRead"),
+		children,
+		unresolved,
+	};
 }

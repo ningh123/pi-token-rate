@@ -26,6 +26,10 @@ on one adaptive line above the editor:
   so the numbers cover the whole session across `/reload`, `/resume`, forks, and
   branch switches. Compactions and branch summaries are timed and counted on a
   row of their own, never folded into a rate.
+- **Subagent output accounted apart.** Children run by pi-subagents stream to
+  their own sessions, so their tokens never pass through this one. The line and
+  the report carry what pi-subagents' accounting reports — cumulative child
+  output on its own segment — marked `+` when some of it could not be read.
 - **Honest numbers.** Live values are estimated from streamed deltas and marked
   with `~` until the provider reports `usage.output`.
 
@@ -108,7 +112,10 @@ comes from the streamed text, thinking, and tool-call deltas:
 
 Only model output counts. The tokens a model spends writing a tool call are
 counted, because they are output tokens; the tool's result is not, because it is
-input for the next request.
+input for the next request. Subagent children are counted by neither side of
+that rule here — their output belongs to their own sessions and is reported
+separately by pi-subagents — so a line with `sub 92k tok` on it still measures
+only the parent's own stream.
 
 ## Summarization
 
@@ -128,6 +135,39 @@ else.
 
 A summary that never reports usage — a cancelled one, or a failed compaction — is
 not recorded at all: there is no output to count and no generation to time.
+
+## Subagents
+
+A subagent child is its own pi session: its messages stream to its own event bus,
+its session file is its own, and nothing about it reaches the extension events
+this meter listens to. That is by design in both extensions — the parent's
+measurement stays the parent's — and it means a family of children producing
+tokens at full speed shows an idle line here, which is exactly when their total
+belongs on it.
+
+pi-subagents exposes the accounting as data — the same report `/subagent-cost`
+renders — over the process event bus, and this extension reads it on the turn
+boundaries its contract asks for: session start, the readiness notice, and every
+settled turn. The answer is cumulative tokens, not a stream, so no child rate
+can be derived from it; what the line gains is a segment —
+
+```
+⚡ ▂▄▆█▆▄▂ 134 tok/s · ttft 0.7s · sub 92k tok · avg 134 tok/s · peak 249 tok/s · 12k tok
+```
+
+— and what the report gains is a row:
+
+```
+    children  92k tok          6 subagents · parallel output, never in the rates above
+```
+
+Child output never enters the average, the peak, the spread or the trace: a
+total that cannot be timed is accounting, not a rate, which is the same rule a
+summarization call follows. A `+` after the count — `sub 92k+ tok` — means some
+async child's usage could not be read, so the figure is a lower bound. Without
+pi-subagents installed the segment and the row simply never appear, and the
+meter never waits on it: an unanswered request costs one timer and is asked
+again at the next turn boundary.
 
 `peak` is the fastest average rate of any single message, recomputed from stored
 tokens and generation time, so it is identical before and after a reload. A
@@ -152,6 +192,7 @@ Token rate · this session
       spread  31 … 744 tok/s    median 175 tok/s
  first token  5.0s              31 of 242 messages timed
    summaries  6.4k tok          3 calls · 41.2s end to end
+    children  92k tok          6 subagents · parallel output, never in the rates above
        trace  ▇█▇██▇█▇█▇█▇█▇█▇██▇█▇█▇█▇█▇█▇██▇  32 bars · 1.0s each · 32.0s span
   43 messages arrived faster than a frame: tokens counted, but no rate can be derived from them
   summarization is timed end to end, so it counts towards the output but not towards the average, the peak or the spread
@@ -179,8 +220,8 @@ report an artificially low figure.
 
 ```
 streaming  ⚡ ▂▄▆█▆▄▂ ~190 tok/s · 6.4s 1.2k tok · ttft 0.7s
-idle       ⚡ ▂▄▆█▆▄▂ 134 tok/s · ttft 0.7s · avg 134 tok/s · peak 249 tok/s · 12k tok
-              trace    rate          live     ttft        avg            peak      total
+idle       ⚡ ▂▄▆█▆▄▂ 134 tok/s · ttft 0.7s · sub 92k tok · avg 134 tok/s · peak 249 tok/s · 12k tok
+              trace    rate          live     ttft        sub           avg            peak      total
 ```
 
 | Field | Meaning |
@@ -190,6 +231,7 @@ idle       ⚡ ▂▄▆█▆▄▂ 134 tok/s · ttft 0.7s · avg 134 tok/s · 
 | `~190 tok/s` | The headline rate. `~` means estimated from stream deltas; without it the provider reported the usage |
 | `6.4s 1.2k tok` | The message in flight: how long it has been running, and the output so far. Dropped as soon as it ends |
 | `ttft 0.7s` | Mean wait for the first token over the messages that reported one |
+| `sub 92k tok` | Output of subagent children this session, as pi-subagents accounted it. `sub 92k+ tok` marks a lower bound. Never inside a rate |
 | `avg 134 tok/s` | Session throughput: output per generation second |
 | `peak 249 tok/s` | Fastest single message this session |
 | `12k tok` | Session output so far, including the message in flight |

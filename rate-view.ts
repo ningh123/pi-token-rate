@@ -10,6 +10,7 @@
  */
 
 import {
+	type ChildUsageSnapshot,
 	formatDuration,
 	formatRate,
 	formatRateSegment,
@@ -132,6 +133,18 @@ export interface RateViewSnapshot {
 	silentElapsedMs: number;
 	/** Bars the trace holds at the configured resolution. */
 	traceSlots: number;
+	/** Cumulative subagent output, when pi-subagents has reported any. */
+	children: ChildReading | undefined;
+}
+
+/** The parts of a {@link ChildUsageSnapshot} the line and the report draw. */
+export interface ChildReading {
+	/** Cumulative output tokens across every counted child. */
+	output: number;
+	/** Children whose usage was counted. */
+	children: number;
+	/** True when some async child could not be read, so the output is a lower bound. */
+	lowerBound: boolean;
 }
 
 /** Inputs for one render. */
@@ -184,6 +197,7 @@ export class RateView {
 	snapshot(now: number): RateViewSnapshot {
 		const live = this.model.live(now);
 		const stats = this.model.stats;
+		const children = readChildren(this.model.children);
 		return {
 			// Before anything is generated, show the session rate rather than 0.
 			rate: live.smoothed > 0 ? live.smoothed : stats.averageRate,
@@ -201,6 +215,7 @@ export class RateView {
 			activity: live.activity,
 			silentElapsedMs: live.silentElapsedMs,
 			traceSlots: this.model.tickCount,
+			children,
 		};
 	}
 
@@ -320,6 +335,17 @@ export class RateView {
 				`${countLabel(stats.summaryMessages, "call", "calls")} · ${formatDuration(stats.summaryElapsedMs)} end to end`,
 			);
 		}
+		// Subagent children are output this session is responsible for but never
+		// sees: their sessions stream to nobody here. The row is the whole account,
+		// because a number that cannot be timed cannot enter a rate either.
+		const children = readChildren(this.model.children);
+		if (children) {
+			row(
+				"children",
+				`${formatTokens(children.output)}${children.lowerBound ? "+" : ""} tok`,
+				`${countLabel(children.children, "subagent")} · parallel output, never in the rates above`,
+			);
+		}
 
 		layoutRow();
 		traceRow();
@@ -349,6 +375,14 @@ export class RateView {
 			notes.push(
 				"summarization is timed end to end, so it counts towards the output but not towards the average, the peak or the spread",
 			);
+		}
+		if (children) {
+			notes.push(
+				"subagent output is reported by pi-subagents at turn boundaries, so it lags a run in progress and never enters a rate",
+			);
+			if (children.lowerBound) {
+				notes.push("some async subagent usage could not be read, so the child output is a lower bound");
+			}
 		}
 		notes.push(
 			stats.allExact
@@ -389,7 +423,7 @@ interface Detail {
  * a missing measurement promotes the next one instead of wasting a slot, and a
  * level never shows an empty gap where a number could have been.
  */
-const DETAIL_LIMIT: Record<DetailLevel, number> = { minimal: 1, compact: 2, full: 5 };
+const DETAIL_LIMIT: Record<DetailLevel, number> = { minimal: 1, compact: 2, full: 6 };
 
 /**
  * Assemble the widget line for a width. Exported for tests: the width
@@ -457,6 +491,16 @@ export function buildWidgetLines(
 	// How long the first token took: the closest thing on the line to a latency.
 	if (snapshot.meanTtftMs !== undefined) {
 		all.push({ text: `ttft ${formatDuration(snapshot.meanTtftMs)}`, repeatsHeadline: false });
+	}
+	// Output the session is responsible for but never sees: subagent children
+	// stream to their own sessions, and the accounting is read at turn boundaries.
+	// It stays on the line while a message streams, because parallel children keep
+	// producing through the parent's own reply.
+	if (snapshot.children) {
+		all.push({
+			text: `sub ${formatTokens(snapshot.children.output)}${snapshot.children.lowerBound ? "+" : ""} tok`,
+			repeatsHeadline: false,
+		});
 	}
 	// The session average: the benchmark the live rate is read against.
 	all.push({ text: averageText, repeatsHeadline: averageText === `avg ${headline}`, hideWhenStreaming: true });
@@ -528,6 +572,17 @@ export function buildWidgetLines(
 	return [
 		`${icon} ${fitTrace(snapshot.trace, snapshot.traceMax, fieldFor(best), style)} ${[rate, ...fragments].join(separator)}`,
 	];
+}
+
+/**
+ * The parts of a child-usage report worth drawing, or undefined when there is
+ * nothing to draw. An all-zero report is a session that ran no children, which
+ * is the absence of the segment rather than a zero on the line.
+ */
+function readChildren(usage: ChildUsageSnapshot | undefined): ChildReading | undefined {
+	if (!usage) return undefined;
+	if (usage.output <= 0 && usage.children <= 0 && usage.unresolved <= 0) return undefined;
+	return { output: usage.output, children: usage.children, lowerBound: usage.unresolved > 0 };
 }
 
 /**

@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-11
+
+### Added
+
+- Subagent children are accounted. A child run by pi-subagents is its own pi
+  session, so its output never streams to this session's events — the meter was
+  blind to a family of children producing tokens at full speed while the parent
+  idled. The line now carries what pi-subagents' in-process `cost` RPC reports:
+  a `sub 92k tok` segment with the cumulative child output, read at session
+  start, on the readiness notice, and at every settled turn, exactly the turn
+  boundaries its contract asks for. The report gains a `children` row with the
+  subagent count.
+- A `+` after the child output — `sub 92k+ tok` — marks a lower bound, shown
+  when pi-subagents could not read some async child's usage, with the caveat on
+  the report.
+
+### Fixed
+
+- A readiness notice from pi-subagents now supersedes an unanswered request
+  instead of being suppressed by it: the startup request is sent before the
+  bridge can answer, and the guard that prevents stacked requests would have
+  kept the first report from ever arriving until the next turn boundary.
+
+### Notes
+
+- Child output never enters the average, the peak, the spread or the trace: a
+  total that cannot be timed is accounting, not a rate — the same rule a
+  summarization call follows. Without pi-subagents the segment and the row
+  never appear; an unanswered request costs one timer and is asked again at the
+  next boundary.
+
 ## [0.2.0] - 2026-10-11
 
 ### Added
@@ -59,5 +90,6 @@ All notable changes to this project are documented in this file. The format foll
   average, the session peak and the session output, plus `/token-rate stats`,
   `/token-rate reset` and configurable position, detail, tick and window.
 
+[0.3.0]: https://github.com/ningh123/pi-token-rate/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ningh123/pi-token-rate/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ningh123/pi-token-rate/releases/tag/v0.1.0
