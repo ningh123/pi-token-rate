@@ -20,16 +20,14 @@ jobs:
       # What trusted publishing verifies: the workflow's OIDC identity.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          # The floor pi itself requires; the extension runs inside it.
-          node-version: 22.19.0
+          # Active LTS; satisfies the package's engines floor (>= 22.19.0).
+          # Its bundled npm 11.x already covers the npm >= 11.5.1 that
+          # trusted publishing requires, so no manual npm upgrade step.
+          node-version: 24
           cache: npm
-      # Trusted publishing needs npm >= 11.5.1; Node 22.19 bundles 10.x.
-      # Pin the npm 11 major instead of @latest: npm 12 requires
-      # Node >= 22.22.2, which would break the Node floor above.
-      - run: npm install -g npm@11
       - run: npm ci
       - name: Check the release tag against package.json
         if: github.event_name == 'release'
