@@ -555,7 +555,7 @@ describe("subagent children", () => {
 		model.setChildren({ output: 34_000, input: 120_000, cacheRead: 90_000, children: 3, unresolved: 0 });
 		const report = new RateView(model).summary(NOW);
 		assert.match(report, /children {2}34k tok\s+3 subagents · parallel output, never in the rates above/, report);
-		assert.match(report, /never enters a rate/, report);
+		assert.match(report, /accounted apart from any rate/, report);
 		// The parent's own account is untouched by the child tokens.
 		assert.match(report, /output {2}400 tok\s+1 message/, report);
 		assert.doesNotMatch(report, /lower bound/, report);

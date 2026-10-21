@@ -233,9 +233,11 @@ export type SummaryKind = "compaction" | "branch-summary";
  *
  * A child is its own pi session: its messages never reach this session's event
  * bus, so nothing about it can be measured while it runs. What pi-subagents
- * reports instead is accounting — the tokens every finished child consumed —
- * read at a turn boundary, which is why this is a snapshot rather than a
- * record: it has no window, and no rate can be derived from it.
+ * reports instead is accounting — the tokens every finished child consumed,
+ * reconciled at a turn boundary — now combined with a live view of the tokens
+ * each running child has produced, read from the status pi-subagents keeps for
+ * its own widgets. Either way this is a snapshot rather than a record: it has
+ * no window, and no rate can be derived from it.
  */
 export interface ChildUsageSnapshot {
 	/** Cumulative output tokens across every counted child. */
@@ -251,6 +253,67 @@ export interface ChildUsageSnapshot {
 	 * lower bound rather than a complete account.
 	 */
 	unresolved: number;
+}
+
+/** One child's usage as one source reports it, under a caller-chosen key. */
+export interface ChildUsageEntry {
+	/** Namespaced by the caller, so entries from different sources never collide. */
+	key: string;
+	output: number;
+	input: number;
+	cacheRead: number;
+}
+
+/** Finalized child accounting from a `cost` report: finished children only. */
+export interface CostChildUsage {
+	entries: readonly ChildUsageEntry[];
+	/** Async children whose usage the report could not read. */
+	unresolved: number;
+}
+
+/** The live view of children that are still running. */
+export interface LiveChildUsage {
+	entries: readonly ChildUsageEntry[];
+	/** True when the live view was bounded and may have omitted a child. */
+	truncated: boolean;
+}
+
+/**
+ * Combine finalized cost accounting with the live view of running children.
+ *
+ * The two sources are disjoint by construction rather than by key: `cost`
+ * counts a child once its metadata is written at completion, while the live
+ * view carries exactly the children pi-subagents still reports as running, so
+ * the union is a sum. A child that leaves the live view before `cost` has
+ * counted it — the poll noticed the completion, the boundary report has not
+ * arrived yet — is passed as `held` and keeps its last live total until the
+ * next report replaces the whole accounting. A held key that reappears live
+ * drops its held copy, so the same child cannot be summed twice while it runs.
+ *
+ * Returns undefined when the union is empty and nothing is unresolved: a
+ * session that ran no children draws no segment at all.
+ */
+export function mergeChildUsage(
+	cost: CostChildUsage | undefined,
+	live: LiveChildUsage | undefined,
+	held: readonly ChildUsageEntry[] | undefined,
+): ChildUsageSnapshot | undefined {
+	const entries: ChildUsageEntry[] = [...(cost?.entries ?? []), ...(live?.entries ?? [])];
+	const liveKeys = new Set(live?.entries.map((entry) => entry.key));
+	for (const entry of held ?? []) {
+		if (!liveKeys.has(entry.key)) entries.push(entry);
+	}
+	const unresolved = (cost?.unresolved ?? 0) + (live?.truncated ? 1 : 0);
+	if (entries.length === 0 && unresolved === 0) return undefined;
+	let output = 0;
+	let input = 0;
+	let cacheRead = 0;
+	for (const entry of entries) {
+		output += entry.output;
+		input += entry.input;
+		cacheRead += entry.cacheRead;
+	}
+	return { output, input, cacheRead, children: entries.length, unresolved };
 }
 
 /** One measured assistant message. */

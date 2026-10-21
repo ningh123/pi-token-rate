@@ -10,12 +10,14 @@ import { describe, it } from "node:test";
 
 import {
 	CHARS_PER_TOKEN,
+	type ChildUsageEntry,
 	estimateTokensFromChars,
 	formatDuration,
 	formatRate,
 	formatRateSegment,
 	formatTokens,
 	MAX_TTFT_MS,
+	mergeChildUsage,
 	SessionRateModel,
 	SPARK_CHARS,
 	sparkline,
@@ -809,5 +811,46 @@ describe("child usage", () => {
 		model.setChildren({ output: 34_000, input: 0, cacheRead: 0, children: 3, unresolved: 0 });
 		model.reset();
 		assert.equal(model.children, undefined);
+	});
+});
+
+describe("mergeChildUsage", () => {
+	const entry = (key: string, output: number, input = 0, cacheRead = 0): ChildUsageEntry => ({ key, output, input, cacheRead });
+
+	it("returns undefined when nothing reported anything", () => {
+		assert.equal(mergeChildUsage(undefined, undefined, undefined), undefined);
+		assert.equal(mergeChildUsage({ entries: [], unresolved: 0 }, { entries: [], truncated: false }, []), undefined);
+	});
+
+	it("sums a cost report on its own", () => {
+		const merged = mergeChildUsage(
+			{ entries: [entry("cost:run:1", 500, 20, 4), entry("cost:run:2", 700, 30, 6)], unresolved: 2 },
+			undefined,
+			undefined,
+		);
+		assert.deepEqual(merged, { output: 1200, input: 50, cacheRead: 10, children: 2, unresolved: 2 });
+	});
+
+	it("sums a live view on its own, marking a bounded one a lower bound", () => {
+		const merged = mergeChildUsage(undefined, { entries: [entry("fleet:1", 300, 10)], truncated: true }, undefined);
+		assert.deepEqual(merged, { output: 300, input: 10, cacheRead: 0, children: 1, unresolved: 1 });
+	});
+
+	it("unions finished and running children, which never share a key", () => {
+		const merged = mergeChildUsage(
+			{ entries: [entry("cost:run:1", 500)], unresolved: 0 },
+			{ entries: [entry("fleet:1", 300)], truncated: false },
+			undefined,
+		);
+		assert.deepEqual(merged, { output: 800, input: 0, cacheRead: 0, children: 2, unresolved: 0 });
+	});
+
+	it("holds a child that left the live view, unless it is back live", () => {
+		const held = [entry("fleet:1", 300), entry("fleet:2", 60)];
+		const stillLive = mergeChildUsage(undefined, { entries: [entry("fleet:2", 90)], truncated: false }, held);
+		assert.deepEqual(stillLive, { output: 390, input: 0, cacheRead: 0, children: 2, unresolved: 0 });
+
+		const noneBack = mergeChildUsage(undefined, { entries: [], truncated: false }, held);
+		assert.deepEqual(noneBack, { output: 360, input: 0, cacheRead: 0, children: 2, unresolved: 0 });
 	});
 });

@@ -28,8 +28,11 @@ on one adaptive line above the editor:
   row of their own, never folded into a rate.
 - **Subagent output accounted apart.** Children run by pi-subagents stream to
   their own sessions, so their tokens never pass through this one. The line and
-  the report carry what pi-subagents' accounting reports — cumulative child
-  output on its own segment — marked `+` when some of it could not be read.
+  the report carry what pi-subagents exposes: the accounting of every finished
+  child, read at turn boundaries, combined with a live read of each running
+  child's tokens — taken from the same status pi-subagents' own widgets draw,
+  refreshed as each child turn ends, never inside a rate — marked `+` when some
+  of it could not be read.
 - **Honest numbers.** Live values are estimated from streamed deltas and marked
   with `~` until the provider reports `usage.output`.
 
@@ -163,7 +166,11 @@ can be derived from it; what the line gains is a segment —
 
 Child output never enters the average, the peak, the spread or the trace: a
 total that cannot be timed is accounting, not a rate, which is the same rule a
-summarization call follows. A `+` after the count — `sub 92k+ tok` — means some
+summarization call follows. The segment no longer waits for a run to finish:
+while children run, their per-child tokens are read live from the status
+pi-subagents keeps for its own fleet view — one in-process request every two
+seconds, exactly as long as something is running — and refreshed as each child
+turn ends. A `+` after the count — `sub 92k+ tok` — means some
 async child's usage could not be read, so the figure is a lower bound. Without
 pi-subagents installed the segment and the row simply never appear, and the
 meter never waits on it: an unanswered request costs one timer and is asked

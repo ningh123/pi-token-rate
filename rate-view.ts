@@ -378,7 +378,7 @@ export class RateView {
 		}
 		if (children) {
 			notes.push(
-				"subagent output is reported by pi-subagents at turn boundaries, so it lags a run in progress and never enters a rate",
+				"subagent output is accounted apart from any rate: live per child turn while children run, reconciled from finished runs at turn boundaries",
 			);
 			if (children.lowerBound) {
 				notes.push("some async subagent usage could not be read, so the child output is a lower bound");
@@ -493,7 +493,8 @@ export function buildWidgetLines(
 		all.push({ text: `ttft ${formatDuration(snapshot.meanTtftMs)}`, repeatsHeadline: false });
 	}
 	// Output the session is responsible for but never sees: subagent children
-	// stream to their own sessions, and the accounting is read at turn boundaries.
+	// stream to their own sessions, so their tokens come from what pi-subagents
+	// accounts — live per child turn while they run, reconciled at boundaries.
 	// It stays on the line while a message streams, because parallel children keep
 	// producing through the parent's own reply.
 	if (snapshot.children) {

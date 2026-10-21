@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-22
+
+### Added
+
+- Subagent output is now visible while children run. The `cost` accounting is
+  reconciled at turn boundaries and counts a child only once its final metadata
+  is written, so a running child contributed nothing to the segment: a family
+  of children could produce tokens at full speed while the meter showed none
+  of it. While children run, their per-child totals are now read live from the
+  fleet view of pi-subagents' in-process `status` RPC — the same active-children
+  projection its own widgets draw, refreshed as each child turn ends — merged
+  as a disjoint union with the finalized accounting: finished children from
+  `cost`, running children from the fleet view, workflow steps asked for
+  per run so an aggregate row can never double count the children a report
+  already holds. The reads are triggered by async-launch and completion
+  notices and by the `subagent` tool calls that host foreground children, they
+  last exactly as long as something is running, and they never touch the
+  session-walking `cost` report, whose contract stays at turn boundaries.
+
+### Fixed
+
+- A cost report that counts no children at all now clears the segment instead
+  of leaving the previous branch's numbers on the line after a branch switch:
+  an empty account is a valid report, not an unreadable one.
+
+### Notes
+
+- Child output never enters the average, the peak, the spread or the trace: a
+  total that cannot be timed is accounting, not a rate — the same rule a
+  summarization call follows. Without pi-subagents the segment and the row
+  never appear; an unanswered request costs one timer and is asked again at the
+  next boundary.
+
 ## [0.3.0] - 2026-10-11
 
 ### Added

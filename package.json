@@ -1,6 +1,6 @@
 {
   "name": "pi-token-rate",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Session-wide output-token throughput for pi: live rate, sparkline, peak, and time to first token",
   "keywords": [
     "pi-package",

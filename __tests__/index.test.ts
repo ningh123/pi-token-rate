@@ -45,6 +45,10 @@ interface Harness {
 	busEmit(channel: string, data?: unknown): void;
 	/** Answer the newest cost request the way pi-subagents would. */
 	answerCost(report: unknown): void;
+	/** Answer the newest request of one method the way pi-subagents would. */
+	answerMethod(method: string, data: unknown): void;
+	/** Answer the newest status request the way pi-subagents would. */
+	answerStatus(data: unknown): void;
 	command(args?: string): Promise<void>;
 	completions(prefix: string): { value: string; label: string; description?: string }[] | null;
 	/** Visible text of the installed widget. */
@@ -181,15 +185,21 @@ function createHarness(options: { mode?: "tui" | "print"; events?: boolean } = {
 			bus?.emit(channel, data);
 		},
 		answerCost(report: unknown) {
-			const request = rpcRequests[rpcRequests.length - 1];
-			assert.ok(request, "a cost request was sent");
+			this.answerMethod("cost", report);
+		},
+		answerMethod(method: string, data: unknown) {
+			const request = [...rpcRequests].reverse().find((candidate) => candidate.method === method);
+			assert.ok(request, `a ${method} request was sent`);
 			bus?.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
 				version: 1,
 				requestId: request.requestId,
-				method: "cost",
+				method,
 				success: true,
-				data: report,
+				data,
 			});
+		},
+		answerStatus(data: unknown) {
+			this.answerMethod("status", data);
 		},
 		async command(args = "") {
 			const command = commands.get("token-rate");
@@ -1093,7 +1103,7 @@ describe("subagent children", () => {
 		await harness.command("stats");
 		const summary = harness.notifications.at(-1) ?? "";
 		assert.match(summary, /children {2}34k tok\s+2 subagents · parallel output, never in the rates above/, summary);
-		assert.match(summary, /never enters a rate/, summary);
+		assert.match(summary, /accounted apart from any rate/, summary);
 		// The parent's own rows are untouched by the child tokens.
 		assert.match(summary, /output {2}400 tok\s+1 message/, summary);
 	});
@@ -1156,5 +1166,179 @@ describe("subagent children", () => {
 		await harness.emit("agent_settled", {});
 		assert.equal(harness.rpcRequests.length, 0);
 		await harness.emit("session_shutdown", {});
+	});
+
+	/** A fleet view with one running child, the shape a status reply carries. */
+	function fleetView(output: number, active = 1, omitted = 0): unknown {
+		return {
+			version: 1,
+			entries: [{ key: "fleet-1", agent: "worker", startedAt: 1, tokens: { input: 100, output, total: 100 + output } }],
+			totalActive: active,
+			omitted,
+		};
+	}
+
+	it("shows live child output while a run is in progress", async () => {
+		const harness = await startedHarness();
+		// An async launch announces itself; the live read that follows draws the
+		// child's tokens before any turn boundary has reported them.
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+
+		const line = harness.line(120);
+		assert.match(line, /sub 5\.0k tok/, line);
+		// The headline and the session rates still describe the parent alone.
+		assert.match(line, /400 tok/, line);
+		assert.doesNotMatch(line, /sub [\d.]+k tok\/s/, line);
+	});
+
+	it("adopts a finished child at its completion notice, without double counting", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k tok/);
+
+		// The completion notice forces the report that counts the child, and the
+		// live read that follows drops it: neither a dip nor a double count.
+		harness.busEmit("subagent:async-complete", {});
+		harness.answerCost(costReport(6000, 1));
+		harness.answerStatus({ fleet: { version: 1, entries: [], totalActive: 0, omitted: 0 } });
+		await sleep(0);
+
+		const line = harness.line(120);
+		assert.match(line, /sub 6\.0k tok/, line);
+		assert.doesNotMatch(line, /sub 11k/, line);
+	});
+
+	it("holds a child that left the live view with no completion notice", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k tok/);
+
+		// A sibling launch — no completion — triggers the next read, in which the
+		// first child has quietly finished mid-workflow: its total is held until
+		// a report adopts it, so the segment keeps both children.
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({
+			fleet: {
+				version: 1,
+				entries: [{ key: "fleet-2", agent: "worker", startedAt: 2, tokens: { input: 50, output: 3000, total: 3050 } }],
+				totalActive: 1,
+				omitted: 0,
+			},
+		});
+		await sleep(0);
+		assert.match(harness.line(120), /sub 8\.0k tok/, harness.line(120));
+
+		// The report that finally counts the held child replaces it, so the two
+		// views never add up to a double count.
+		await harness.emit("agent_settled", {});
+		harness.answerCost({
+			version: 1,
+			parent: { input: 1000, output: 400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+			children: [
+				{
+					label: "Child 1 (worker)",
+					agent: "worker",
+					runId: "r1",
+					usage: { input: 100, output: 5000, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 4 },
+				},
+			],
+			childTotal: { input: 100, output: 5000, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 4 },
+			total: { input: 1100, output: 5400, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 5 },
+			unresolvedAsyncChildren: 0,
+		});
+		const line = harness.line(120);
+		assert.match(line, /sub 8\.0k tok/, line);
+		assert.doesNotMatch(line, /sub 13k/, line);
+	});
+
+	it("counts only the running steps of a workflow, never its aggregate row", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagent:async-started", {});
+		// The fleet row for a workflow aggregates every child it has finished —
+		// 9k here — while the snapshot still reports the run as going, so the
+		// steps are asked for instead.
+		harness.answerStatus({
+			fleet: {
+				version: 1,
+				entries: [{ key: "fleet-9", agent: "workflow", startedAt: 1, tokens: { input: 0, output: 9000, total: 9000 } }],
+				totalActive: 1,
+				omitted: 0,
+			},
+			asyncSnapshot: { version: 1, runs: [{ id: "wf-1", kind: "workflow", state: "running" }] },
+		});
+		await sleep(0);
+		harness.answerStatus({
+			details: {
+				steps: [
+					{ agent: "a", status: "running", tokens: { input: 10, output: 1200, total: 1210 }, workflowKey: "k1" },
+					{ agent: "b", status: "running", tokens: { input: 5, output: 800, total: 805 }, workflowKey: "k2" },
+					{ agent: "c", status: "complete", tokens: { input: 7, output: 5000, total: 5007 }, workflowKey: "k3" },
+				],
+			},
+		});
+		await sleep(0);
+
+		// 1200 + 800 from the running steps; neither the 9k aggregate nor the
+		// finished child's 5k may appear.
+		const line = harness.line(120);
+		assert.match(line, /sub 2\.0k tok/, line);
+		assert.doesNotMatch(line, /sub 9\.0k|sub 7\.0k/, line);
+	});
+
+	it("marks the live view a lower bound when the fleet view was bounded", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000, 2, 1) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k\+ tok/, harness.line(120));
+	});
+
+	it("reads a foreground child from the subagent tool call that hosts it", async () => {
+		const harness = await startedHarness();
+		await harness.emit("tool_execution_start", {
+			type: "tool_execution_start",
+			toolCallId: "t1",
+			toolName: "subagent",
+			args: {},
+		});
+		harness.answerStatus({ fleet: fleetView(3000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 3\.0k tok/);
+
+		// The call ends: the child lands in the session, the report counts it,
+		// and the reads stop once the live view is empty.
+		await harness.emit("tool_execution_end", { type: "tool_execution_end", toolCallId: "t1", toolName: "subagent" });
+		harness.answerCost(costReport(3200, 1));
+		harness.answerStatus({ fleet: { version: 1, entries: [], totalActive: 0, omitted: 0 } });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 3\.2k tok/);
+	});
+
+	it("falls back to cost alone when the bridge has no fleet view", async () => {
+		const harness = await startedHarness();
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({});
+		await sleep(0);
+		assert.doesNotMatch(harness.line(120), /sub /, harness.line(120));
+
+		// The installed pi-subagents predates the fleet view: further triggers
+		// are ignored rather than retried on a schedule.
+		harness.busEmit("subagent:async-started", {});
+		await sleep(0);
+		const statusRequests = harness.rpcRequests.filter((request) => request.method === "status");
+		assert.equal(statusRequests.length, 1);
+
+		// The readiness notice gives a reloaded bridge a second chance.
+		harness.busEmit("subagents:rpc:v1:ready", {});
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k tok/);
 	});
 });

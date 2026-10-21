@@ -26,9 +26,11 @@
  *
  * Subagent children (pi-subagents) stream to their own sessions, so their
  * output never reaches this session's events either. What is shown instead is
- * the accounting pi-subagents exposes on the process event bus: cumulative
- * child tokens, read at turn boundaries and drawn on a segment of its own —
- * never inside a rate, for the same reason as a summary.
+ * what pi-subagents exposes on the process event bus: the accounting of every
+ * finished child, read at turn boundaries, combined with a live read of the
+ * tokens each running child has produced — the same status its own widgets
+ * draw, taken while children run. Both land on a segment of their own, never
+ * inside a rate, for the same reason as a summary.
  *
  * Commands, with the default bracketed:
  *   /token-rate                        toggle the display
@@ -46,7 +48,14 @@ import { randomUUID } from "node:crypto";
 
 import type { ExtensionAPI, ExtensionContext, ExtensionWidgetOptions } from "@earendil-works/pi-coding-agent";
 
-import { type ChildUsageSnapshot, type MessageRecord, SessionRateModel, type SummaryKind } from "./metrics.ts";
+import {
+	type ChildUsageEntry,
+	type CostChildUsage,
+	type MessageRecord,
+	mergeChildUsage,
+	SessionRateModel,
+	type SummaryKind,
+} from "./metrics.ts";
 import { DETAIL_LEVELS, type DetailLevel, RateView, type StyleFn, visibleWidth } from "./rate-view.ts";
 
 /** Entry type for the rate records appended to the session. */
@@ -73,6 +82,35 @@ const subagentRpcReply = (requestId: string) => `subagents:rpc:v1:reply:${reques
  * because the next turn boundary asks again.
  */
 const COST_TIMEOUT_MS = 3000;
+
+/** pi-subagents' in-process notifications about async runs, used as poll triggers. */
+const SUBAGENT_ASYNC_STARTED = "subagent:async-started";
+const SUBAGENT_ASYNC_COMPLETE = "subagent:async-complete";
+
+/**
+ * Interval between live child-usage reads while children are running.
+ *
+ * A child's tokens move once per assistant turn, seconds apart at the fastest,
+ * so a two-second read is as live as the data can be, and it costs one
+ * in-process status request against the projection pi-subagents keeps for its
+ * own widgets — never the session-walking cost report, whose contract says
+ * turn boundaries only.
+ */
+const LIVE_POLL_MS = 2000;
+
+/** Longest wait for a status reply before the read is given up as unanswered. */
+const STATUS_TIMEOUT_MS = 3000;
+
+/**
+ * Fleet rows pi-subagents names after the run mode rather than an agent. Such
+ * a row's tokens aggregate the whole run — finished children included — which
+ * the cost report already counts, so adding it live would count those children
+ * twice. Per-child rows and single runs carry a real agent name instead.
+ */
+const AGGREGATE_FLEET_AGENTS = new Set(["workflow", "chain", "parallel"]);
+
+/** Run and step states that mean the child is still producing, or about to. */
+const ACTIVE_RUN_STATES = new Set(["running", "queued", "pending"]);
 
 /** One measured message as stored in the session. */
 interface RateRecordEntry {
@@ -273,58 +311,275 @@ export default function tokenRate(pi: ExtensionAPI) {
 		renderWidget(ctx);
 	}
 
-	/** The cost request currently out, when one is. */
-	let costOut: { unsubscribe: () => void; cancelTimer: () => void } | undefined;
+	/**
+	 * One request on pi-subagents' in-process RPC bridge.
+	 *
+	 * The bridge is another extension: a reply can be malformed, late, or never
+	 * come, so every request carries its own timeout, runs its callback exactly
+	 * once — synchronously when the reply arrives, with undefined when it does
+	 * not — and releases its subscription either way. The timer is unref'd so a
+	 * request that outlives the process's other work cannot keep it alive.
+	 */
+	function requestSubagentRpc(
+		method: string,
+		params: Record<string, unknown> | undefined,
+		timeoutMs: number,
+		onData: (data: unknown) => void,
+	): void {
+		const bus = pi.events;
+		if (!bus) return;
+		const requestId = randomUUID();
+		let settled = false;
+		const unsubscribe = bus.on(subagentRpcReply(requestId), (raw) => {
+			finish(isRecord(raw) && raw.success === true ? raw.data : undefined);
+		});
+		const timer = setTimeout(() => finish(undefined), timeoutMs);
+		timer.unref?.();
+		function finish(data: unknown): void {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			unsubscribe();
+			onData(data);
+		}
+		bus.emit(
+			SUBAGENT_RPC_REQUEST,
+			params === undefined ? { version: 1, requestId, method } : { version: 1, requestId, method, params },
+		);
+	}
 
-	/** Drop the outstanding cost request without waiting for its reply or timeout. */
-	function releaseCostRequest(): void {
-		const out = costOut;
-		costOut = undefined;
-		if (!out) return;
-		out.cancelTimer();
-		out.unsubscribe();
+	/** The promise shape of {@link requestSubagentRpc}, for chained reads. */
+	function requestSubagentRpcData(
+		method: string,
+		params: Record<string, unknown> | undefined,
+		timeoutMs: number,
+	): Promise<unknown> {
+		return new Promise((resolve) => requestSubagentRpc(method, params, timeoutMs, resolve));
+	}
+
+	/** Whether a cost request is out, and which one its replies must be for. */
+	let costOut = false;
+	let costGeneration = 0;
+
+	/** Finalized child accounting from the latest cost report a reply carried. */
+	let costChildren: CostChildUsage | undefined;
+
+	/** Running children as the latest live read reported them, by source key. */
+	const liveChildren = new Map<string, ChildUsageEntry>();
+
+	/**
+	 * Children that left the live view with no completion notice behind them,
+	 * by the same key — a child that finishes mid-workflow, picked up by the
+	 * next report rather than any event. Their last live total is held so the
+	 * segment cannot dip while the accounting catches up.
+	 */
+	const heldChildren = new Map<string, ChildUsageEntry>();
+
+	/**
+	 * True from a completion notice until the next poll: the notice forced a
+	 * cost report, so children dropping out of that poll's view are already
+	 * counted, and holding them would count them twice.
+	 */
+	let completionNoticeSincePoll = false;
+
+	/** True when the latest live read was bounded and may have omitted a child. */
+	let liveTruncated = false;
+
+	/** The scheduled live read, when one is. */
+	let livePollTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/** Guards against a second read starting while one is out. */
+	let livePollInFlight = false;
+
+	/**
+	 * Bumped whenever the session whose children are being read is replaced:
+	 * a read that comes back for a session that has ended must not touch the
+	 * model the replacement installed.
+	 */
+	let liveGeneration = 0;
+
+	/** Open `subagent` tool calls: each one hosts a foreground child. */
+	let foregroundSubagentCalls = 0;
+
+	/**
+	 * True until a status reply proves the installed pi-subagents carries a
+	 * fleet view. Reset by the readiness notice and a fresh session, because
+	 * both can load a version that has one; while it holds, the segment falls
+	 * back to cost accounting alone.
+	 */
+	let liveUnsupported = false;
+
+	/** Fold the three sources into the segment the line draws. */
+	function refreshChildSnapshot(): void {
+		const held = [...heldChildren.values()].filter((entry) => !liveChildren.has(entry.key));
+		state.model.setChildren(
+			mergeChildUsage(costChildren, { entries: [...liveChildren.values()], truncated: liveTruncated }, held),
+		);
+		render(true);
 	}
 
 	/**
 	 * Ask pi-subagents for this session's parent-plus-child token accounting.
 	 *
 	 * A child is its own pi session, so nothing about it streams to this
-	 * extension: the cost report is the supported accounting view, and it is read
-	 * on turn boundaries rather than on a timer, exactly as its contract asks.
+	 * extension: the cost report is the supported accounting view, and it is
+	 * read on turn boundaries and completions rather than on a timer, exactly
+	 * as its contract asks. A report supersedes everything the live view held:
+	 * the children it counts are finished and authoritative now, and whatever
+	 * was held from the live view belonged to children it would have counted.
 	 * An unanswered request — pi-subagents not installed, or not ready yet —
-	 * simply tries again at the next boundary. A readiness notice forces a fresh
-	 * request, because whatever was asked before it was asked of a bridge that
-	 * was not there to answer.
+	 * simply tries again at the next boundary.
 	 */
 	function requestChildUsage(force = false): void {
-		const bus = pi.events;
-		if (!bus) return;
+		if (!pi.events) return;
 		if (costOut && !force) return;
-		releaseCostRequest();
-		const requestId = randomUUID();
-		const unsubscribe = bus.on(subagentRpcReply(requestId), (raw) => {
-			releaseCostRequest();
-			const usage = parseChildUsageReport(raw);
-			if (usage === undefined) return;
-			state.model.setChildren(usage);
-			render(true);
+		const generation = ++costGeneration;
+		costOut = true;
+		requestSubagentRpc("cost", undefined, COST_TIMEOUT_MS, (data) => {
+			// A superseded request keeps quiet: its replacement owns the
+			// outstanding slot and the accounting that will land in it.
+			if (generation !== costGeneration) return;
+			costOut = false;
+			const report = parseChildUsageReport(data);
+			if (report === undefined) return;
+			costChildren = report;
+			heldChildren.clear();
+			refreshChildSnapshot();
 		});
-		const timer = setTimeout(() => releaseCostRequest(), COST_TIMEOUT_MS);
-		costOut = { unsubscribe, cancelTimer: () => clearTimeout(timer) };
-		bus.emit(SUBAGENT_RPC_REQUEST, { version: 1, requestId, method: "cost" });
+	}
+
+	/**
+	 * Start reading live child usage, if a read is not already out.
+	 *
+	 * The reads are triggered, never free-running: an async launch announces
+	 * itself on the bus, a foreground child runs inside a `subagent` tool call
+	 * this session can see, and a completion asks again for whatever siblings
+	 * are still going. Each read decides whether another one is worth
+	 * scheduling, so the reads last exactly as long as children are running.
+	 * A reload that leaves async runs behind is the one announcement this
+	 * extension cannot hear — the bridge reloaded too — and those children are
+	 * picked up again by their completion notice and the next cost report.
+	 */
+	function ensureLivePolling(): void {
+		if (!pi.events || liveUnsupported || livePollInFlight) return;
+		// A pending timer sets the cadence, not a lock: a trigger that arrives
+		// while the next read is still scheduled gets an immediate read, and the
+		// single-timer guard keeps the cadence from doubling.
+		const generation = liveGeneration;
+		livePollInFlight = true;
+		void pollLiveChildren(generation).finally(() => {
+			livePollInFlight = false;
+		});
+	}
+
+	/** Schedule the next live read; unref'd so it never holds the process open. */
+	function scheduleLivePoll(generation: number): void {
+		if (livePollTimer !== undefined) return;
+		livePollTimer = setTimeout(() => {
+			livePollTimer = undefined;
+			if (liveUnsupported || generation !== liveGeneration) return;
+			// A triggered read is out: keep the cadence by trying again later,
+			// rather than running a second read beside it.
+			if (livePollInFlight) {
+				scheduleLivePoll(generation);
+				return;
+			}
+			livePollInFlight = true;
+			void pollLiveChildren(generation).finally(() => {
+				livePollInFlight = false;
+			});
+		}, LIVE_POLL_MS);
+		livePollTimer.unref?.();
+	}
+
+	/**
+	 * Read the tokens of every child that is still running, from the status
+	 * pi-subagents keeps for its own widgets.
+	 *
+	 * The untargeted reply's fleet view lists exactly the active children — a
+	 * finished child drops out — with per-child tokens that move as each of its
+	 * turns ends. Workflow runs appear there as one aggregate row, so each of
+	 * them is asked separately for its steps, and only the steps still running
+	 * are counted: the finished ones are already in the cost report. A child
+	 * that left the view with no completion notice behind it finished quietly,
+	 * mid-workflow, and is held at its last total until a report adopts it.
+	 */
+	async function pollLiveChildren(generation: number): Promise<void> {
+		const data = await requestSubagentRpcData("status", {}, STATUS_TIMEOUT_MS);
+		if (generation !== liveGeneration) return;
+		const fleet = parseFleetView(isRecord(data) ? data.fleet : undefined, isRecord(data) ? data.asyncSnapshot : undefined);
+		if (fleet === undefined) {
+			// The bridge answered, but not with a fleet view: the installed
+			// pi-subagents predates it. Further triggers are ignored until the
+			// readiness notice or a fresh session loads a version that has one.
+			liveUnsupported = true;
+			return;
+		}
+		const entries = fleet.entries;
+		for (const workflowRunId of fleet.workflowRuns) {
+			const steps = await requestSubagentRpcData("status", { id: workflowRunId }, STATUS_TIMEOUT_MS);
+			if (generation !== liveGeneration) return;
+			entries.push(...workflowStepEntries(workflowRunId, steps));
+		}
+		// A child that left the view with no completion notice behind it finished
+		// quietly, mid-workflow: hold its last total until a report adopts it. A
+		// completion notice already forced that report, so its children are
+		// counted — holding them would count them twice.
+		for (const [key, entry] of liveChildren) {
+			if (!entries.some((candidate) => candidate.key === key) && !completionNoticeSincePoll) heldChildren.set(key, entry);
+		}
+		completionNoticeSincePoll = false;
+		liveChildren.clear();
+		for (const entry of entries) liveChildren.set(entry.key, entry);
+		liveTruncated = fleet.truncated;
+		refreshChildSnapshot();
+		if (fleet.totalActive > 0 || foregroundSubagentCalls > 0) scheduleLivePoll(generation);
+	}
+
+	/** Drop the scheduled live read and everything the live view held. */
+	function resetLiveUsage(): void {
+		liveGeneration++;
+		if (livePollTimer !== undefined) {
+			clearTimeout(livePollTimer);
+			livePollTimer = undefined;
+		}
+		liveChildren.clear();
+		heldChildren.clear();
+		liveTruncated = false;
+		completionNoticeSincePoll = false;
+		foregroundSubagentCalls = 0;
 	}
 
 	/**
 	 * Listen for pi-subagents' readiness notice, which also arrives after a
 	 * `/reload` of either extension. The subscription outlives session switches,
 	 * so it is re-armed rather than stacked: `session_start` fires for every
-	 * session the process opens.
+	 * session the process opens. Async lifecycle notices are subscribed here
+	 * too: they are the announcements that start and stop the live reads.
 	 */
 	function subscribeSubagentRpc(): void {
 		const bus = pi.events;
 		if (!bus) return;
 		for (const unsubscribe of state.busSubscriptions.splice(0)) unsubscribe();
-		state.busSubscriptions.push(bus.on(SUBAGENT_RPC_READY, () => requestChildUsage(true)));
+		state.busSubscriptions.push(
+			bus.on(SUBAGENT_RPC_READY, () => {
+				// A reloaded bridge may be a newer pi-subagents than the one that
+				// answered before, so the fleet view deserves a second chance.
+				liveUnsupported = false;
+				requestChildUsage(true);
+			}),
+		);
+		state.busSubscriptions.push(bus.on(SUBAGENT_ASYNC_STARTED, () => ensureLivePolling()));
+		state.busSubscriptions.push(
+			bus.on(SUBAGENT_ASYNC_COMPLETE, () => {
+				// The finished child's accounting is final now, and siblings may
+				// still be going: force the report so the child changes hands
+				// without a dip or a double count, and keep reading the rest.
+				completionNoticeSincePoll = true;
+				requestChildUsage(true);
+				ensureLivePolling();
+			}),
+		);
 	}
 
 	/**
@@ -345,6 +600,13 @@ export default function tokenRate(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		state.ctx = ctx;
 		state.prefs = { ...DEFAULT_PREFS, ...readPersistedPrefs(ctx) };
+		// The fresh session owns nothing yet: whatever the previous session was
+		// reading belongs to its model, and its outstanding replies must not land
+		// in this one.
+		resetLiveUsage();
+		liveUnsupported = false;
+		costChildren = undefined;
+		costGeneration++;
 		// Seed from this session's own history, so statistics cover the whole
 		// session instead of only the part observed since the last load.
 		const model = new SessionRateModel();
@@ -404,17 +666,32 @@ export default function tokenRate(pi: ExtensionAPI) {
 
 	// Tool calls produce no output tokens. Observing the clock lets the smoothed
 	// rate decay, while the trace keeps its last shape instead of disappearing.
-	pi.on("tool_execution_start", async (_event, ctx) => {
+	pi.on("tool_execution_start", async (event, ctx) => {
 		state.ctx = ctx;
 		state.model.observe(Date.now());
+		// A foreground child runs inside a `subagent` tool call, so the call
+		// itself is the announcement that live reading should cover it.
+		if (event.toolName === "subagent") {
+			foregroundSubagentCalls++;
+			ensureLivePolling();
+		}
 		render(true);
 	});
 
-	pi.on("tool_execution_end", async (_event, ctx) => {
+	pi.on("tool_execution_end", async (event, ctx) => {
 		state.ctx = ctx;
 		// The next message's wait is measured from here, not from the turn start.
 		state.lastStepEndedAt = Date.now();
 		state.model.observe(state.lastStepEndedAt);
+		// A finished foreground child lands in the session's tool result, so the
+		// cost report can count it now; one more live read lets the fleet view
+		// drop it, and the reads stop once nothing is left.
+		if (event.toolName === "subagent") {
+			foregroundSubagentCalls = Math.max(0, foregroundSubagentCalls - 1);
+			completionNoticeSincePoll = true;
+			requestChildUsage(true);
+			ensureLivePolling();
+		}
 		render(true);
 	});
 
@@ -475,7 +752,10 @@ export default function tokenRate(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		state.ctx = undefined;
-		releaseCostRequest();
+		// A reply in flight belongs to a session that is over; the bump makes it
+		// a no-op wherever it lands.
+		costGeneration++;
+		resetLiveUsage();
 		for (const unsubscribe of state.busSubscriptions.splice(0)) unsubscribe();
 	});
 
@@ -736,28 +1016,134 @@ function usageField(block: Record<string, unknown> | undefined, field: string): 
 }
 
 /**
- * Read a child-usage snapshot out of a `cost` reply.
+ * Finalized child accounting read out of a `cost` reply's data.
  *
  * The reply is data from another extension on the process event bus, so it is
  * validated the way session entries are: a report that cannot be identified is
- * not one this version knows how to count. An account with nothing in it is
- * returned as undefined, so a session that ran no children draws no segment.
+ * not one this version knows how to count, and undefined means exactly that —
+ * an account with nothing in it is a valid, empty report, so the segment can
+ * drop what a branch switch made stale. Each child is keyed by what identifies
+ * it best, so the entries stay one child each however the report labeled them.
+ * A report that predates per-child entries is read as one aggregate entry.
  */
-function parseChildUsageReport(reply: unknown): ChildUsageSnapshot | undefined {
-	if (!isRecord(reply) || reply.success !== true) return undefined;
-	const data = reply.data;
+function parseChildUsageReport(data: unknown): CostChildUsage | undefined {
 	if (!isRecord(data)) return undefined;
+	const unresolved = nonNegativeNumber(data.unresolvedAsyncChildren) ?? 0;
+	if (Array.isArray(data.children)) {
+		const entries: ChildUsageEntry[] = [];
+		for (const [index, child] of data.children.entries()) {
+			if (!isRecord(child)) continue;
+			const usage = isRecord(child.usage) ? child.usage : undefined;
+			const key =
+				typeof child.runId === "string" && child.runId
+					? `cost:run:${child.runId}`
+					: typeof child.sessionFile === "string" && child.sessionFile
+						? `cost:session:${child.sessionFile}`
+						: `cost:child:${index}`;
+			entries.push({
+				key,
+				output: usageField(usage, "output"),
+				input: usageField(usage, "input"),
+				cacheRead: usageField(usage, "cacheRead"),
+			});
+		}
+		return { entries, unresolved };
+	}
+	// The aggregate-only shape: without a number to read there is no report.
 	const childTotal = isRecord(data.childTotal) ? data.childTotal : undefined;
 	const output = nonNegativeNumber(childTotal?.output);
 	if (output === undefined) return undefined;
-	const children = Array.isArray(data.children) ? data.children.length : 0;
-	const unresolved = nonNegativeNumber(data.unresolvedAsyncChildren) ?? 0;
-	if (output === 0 && children === 0 && unresolved === 0) return undefined;
 	return {
-		output,
-		input: usageField(childTotal, "input"),
-		cacheRead: usageField(childTotal, "cacheRead"),
-		children,
+		entries: [
+			{ key: "cost:total", output, input: usageField(childTotal, "input"), cacheRead: usageField(childTotal, "cacheRead") },
+		],
 		unresolved,
 	};
+}
+
+/** The fleet view of a status reply: the children that are still running. */
+interface FleetView {
+	/** Running children with their cumulative tokens, keyed per source. */
+	entries: ChildUsageEntry[];
+	/** Whether the view was bounded and omitted children. */
+	truncated: boolean;
+	/** Active children the view knows about, skipped aggregate rows included. */
+	totalActive: number;
+	/** Async workflow runs that are still going, by run id. */
+	workflowRuns: string[];
+}
+
+/**
+ * Read the live fleet view out of a `status` reply.
+ *
+ * The fleet lists exactly the children pi-subagents still counts as active — a
+ * finished child drops out — with the cumulative tokens its own widgets draw.
+ * Rows named after a run mode rather than an agent are skipped: their tokens
+ * aggregate the whole run, finished children included. The run ids the
+ * snapshot still reports as going are what the aggregate workflow rows are
+ * replaced with. Undefined means the reply carried no fleet view at all.
+ */
+function parseFleetView(fleet: unknown, snapshot: unknown): FleetView | undefined {
+	if (!isRecord(fleet)) return undefined;
+	const entries: ChildUsageEntry[] = [];
+	for (const entry of Array.isArray(fleet.entries) ? fleet.entries : []) {
+		if (!isRecord(entry)) continue;
+		const agent = typeof entry.agent === "string" ? entry.agent : "";
+		if (AGGREGATE_FLEET_AGENTS.has(agent)) continue;
+		if (typeof entry.key !== "string" || !entry.key) continue;
+		const tokens = isRecord(entry.tokens) ? entry.tokens : undefined;
+		entries.push({
+			key: `fleet:${entry.key}`,
+			output: usageField(tokens, "output"),
+			input: usageField(tokens, "input"),
+			// The fleet view carries no cache split; its input is the raw input.
+			cacheRead: 0,
+		});
+	}
+	const workflowRuns: string[] = [];
+	if (isRecord(snapshot) && Array.isArray(snapshot.runs)) {
+		for (const run of snapshot.runs) {
+			if (!isRecord(run) || run.kind !== "workflow") continue;
+			if (!ACTIVE_RUN_STATES.has(String(run.state))) continue;
+			if (typeof run.id === "string" && run.id) workflowRuns.push(run.id);
+		}
+	}
+	return {
+		entries,
+		truncated: (nonNegativeNumber(fleet.omitted) ?? 0) > 0,
+		totalActive: nonNegativeNumber(fleet.totalActive) ?? entries.length,
+		workflowRuns,
+	};
+}
+
+/**
+ * Read a workflow's running steps out of a targeted `status` reply.
+ *
+ * A workflow run is one fleet row whose tokens cover every child it has
+ * finished, so the per-child totals come from the run's own steps instead:
+ * exactly the steps still running are counted, because the finished ones are
+ * already in the cost report. Step tokens are cumulative per step and move as
+ * each of the step's turns ends.
+ */
+function workflowStepEntries(runId: string, data: unknown): ChildUsageEntry[] {
+	const details = isRecord(data) ? data.details : undefined;
+	const steps = isRecord(details) && Array.isArray(details.steps) ? details.steps : [];
+	const entries: ChildUsageEntry[] = [];
+	for (const [index, step] of steps.entries()) {
+		if (!isRecord(step) || !ACTIVE_RUN_STATES.has(String(step.status))) continue;
+		const tokens = isRecord(step.tokens) ? step.tokens : undefined;
+		const stepKey =
+			typeof step.workflowKey === "string" && step.workflowKey
+				? step.workflowKey
+				: typeof step.runId === "string" && step.runId
+					? step.runId
+					: `step:${index}`;
+		entries.push({
+			key: `workflow:${runId}:${stepKey}`,
+			output: usageField(tokens, "output"),
+			input: usageField(tokens, "input"),
+			cacheRead: usageField(tokens, "cacheRead"),
+		});
+	}
+	return entries;
 }
