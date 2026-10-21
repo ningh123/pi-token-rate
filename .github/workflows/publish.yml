@@ -1,0 +1,38 @@
+name: Publish
+
+# npm publishing through trusted publishing: the registry verifies this
+# workflow's OIDC identity against the trusted publisher configured for the
+# package, so there is no token to store, rotate, or leak. A GitHub Release on
+# a vX.Y.Z tag publishes the version in package.json; workflow_dispatch
+# publishes straight from a ref, which also covers tags too old to carry this
+# workflow -- a release only fires a workflow that exists at its tagged commit.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # What trusted publishing verifies: the workflow's OIDC identity.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The floor pi itself requires; the extension runs inside it.
+          node-version: 22.19.0
+          cache: npm
+      # Trusted publishing needs npm >= 11.5.1; Node 22.19 bundles 10.x.
+      # Pin the npm 11 major instead of @latest: npm 12 requires
+      # Node >= 22.22.2, which would break the Node floor above.
+      - run: npm install -g npm@11
+      - run: npm ci
+      - name: Check the release tag against package.json
+        if: github.event_name == 'release'
+        run: test "v$(node -p "require('./package.json').version")" = "${{ github.event.release.tag_name }}"
+      # prepublishOnly type-checks, lints, and tests before the tarball is built.
+      - run: npm publish --provenance
