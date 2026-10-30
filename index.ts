@@ -29,8 +29,12 @@
  * what pi-subagents exposes on the process event bus: the accounting of every
  * finished child, read at turn boundaries, combined with a live read of the
  * tokens each running child has produced — the same status its own widgets
- * draw, taken while children run. Both land on a segment of their own, never
- * inside a rate, for the same reason as a summary.
+ * draw. The reads are driven by notices rather than a cadence: pi-subagents
+ * announces every change to its background job view, the parent's own
+ * `subagent` tool call reports foreground progress as it streams, and a
+ * quiet-period watcher keeps the old cadence only while children run and no
+ * notice arrives. Both land on a segment of their own, never inside a rate,
+ * for the same reason as a summary.
  *
  * Commands, with the default bracketed:
  *   /token-rate                        toggle the display
@@ -88,15 +92,35 @@ const SUBAGENT_ASYNC_STARTED = "subagent:async-started";
 const SUBAGENT_ASYNC_COMPLETE = "subagent:async-complete";
 
 /**
- * Interval between live child-usage reads while children are running.
- *
- * A child's tokens move once per assistant turn, seconds apart at the fastest,
- * so a two-second read is as live as the data can be, and it costs one
- * in-process status request against the projection pi-subagents keeps for its
- * own widgets — never the session-walking cost report, whose contract says
- * turn boundaries only.
+ * pi-subagents' in-process notice that its background job view changed: a run
+ * started, moved to its next step, produced new activity, or finished. It is
+ * the signal to read the live view again instead of on a cadence, and it fires
+ * even when pi-subagents' own async widget is turned off.
  */
-const LIVE_POLL_MS = 2000;
+const SUBAGENT_JOBS_CHANGED = "subagent:jobs-changed";
+
+/**
+ * Minimum spacing between notice-driven live reads.
+ *
+ * The notices can repeat and arrive in bursts — about once per second per run
+ * while a child streams — so a burst is folded into one read and the next
+ * notice within this window only resets the quiet-period watcher.
+ */
+const LIVE_COALESCE_MS = 1000;
+
+/**
+ * Longest quiet stretch while children run before the live view is read again
+ * anyway.
+ *
+ * The notices cover background runs and the `subagent` tool call covers
+ * foreground ones, but neither is guaranteed: a pi-subagents older than the
+ * notices never sends them, and some sessions cannot. While the latest read
+ * still reports active children — or a `subagent` call that hosts one is open
+ * ahead of the fleet listing it — this watcher keeps the reads coming at the
+ * cadence the notices would have set, so those cases fall back to exactly the
+ * polling this replaces.
+ */
+const LIVE_WATCHDOG_MS = 2000;
 
 /** Longest wait for a status reply before the read is given up as unanswered. */
 const STATUS_TIMEOUT_MS = 3000;
@@ -230,7 +254,20 @@ interface SessionState {
 	busSubscriptions: (() => void)[];
 }
 
-export default function tokenRate(pi: ExtensionAPI) {
+/**
+ * Live-read timing, overridable so tests can exercise the triggers without
+ * waiting out the real intervals.
+ */
+export interface LiveReadTiming {
+	/** Minimum spacing between notice-driven live reads. */
+	liveCoalesceMs?: number;
+	/** Quiet stretch while children run before the live view is read again anyway. */
+	liveWatchdogMs?: number;
+}
+
+export default function tokenRate(pi: ExtensionAPI, timing: LiveReadTiming = {}) {
+	const liveCoalesceMs = timing.liveCoalesceMs ?? LIVE_COALESCE_MS;
+	const liveWatchdogMs = timing.liveWatchdogMs ?? LIVE_WATCHDOG_MS;
 	// The view and the model are the same objects for the whole session: the
 	// widget reads the view on every frame, so replacing the model replaces both.
 	const model = new SessionRateModel();
@@ -385,7 +422,13 @@ export default function tokenRate(pi: ExtensionAPI) {
 	/** True when the latest live read was bounded and may have omitted a child. */
 	let liveTruncated = false;
 
-	/** The scheduled live read, when one is. */
+	/** True when a notice arrived while a read was in flight, so another follows. */
+	let liveQueued = false;
+
+	/** When the last live read started, which is what the coalesce window measures. */
+	let lastLiveReadAt = 0;
+
+	/** The scheduled quiet-period watcher, when one is armed. */
 	let livePollTimer: ReturnType<typeof setTimeout> | undefined;
 
 	/** Guards against a second read starting while one is out. */
@@ -399,7 +442,7 @@ export default function tokenRate(pi: ExtensionAPI) {
 	let liveGeneration = 0;
 
 	/** Open `subagent` tool calls: each one hosts a foreground child. */
-	let foregroundSubagentCalls = 0;
+	let openSubagentCalls = 0;
 
 	/**
 	 * True until a status reply proves the installed pi-subagents carries a
@@ -449,46 +492,74 @@ export default function tokenRate(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Start reading live child usage, if a read is not already out.
+	 * Run one live read now, and run the next queued one after it lands.
 	 *
-	 * The reads are triggered, never free-running: an async launch announces
-	 * itself on the bus, a foreground child runs inside a `subagent` tool call
-	 * this session can see, and a completion asks again for whatever siblings
-	 * are still going. Each read decides whether another one is worth
-	 * scheduling, so the reads last exactly as long as children are running.
-	 * A reload that leaves async runs behind is the one announcement this
-	 * extension cannot hear — the bridge reloaded too — and those children are
-	 * picked up again by their completion notice and the next cost report.
+	 * A notice that arrives while the read is out is remembered rather than
+	 * dropped, so the change it announced is not missed — the fresh view is
+	 * asked for again the moment the current one lands.
 	 */
-	function ensureLivePolling(): void {
-		if (!pi.events || liveUnsupported || livePollInFlight) return;
-		// A pending timer sets the cadence, not a lock: a trigger that arrives
-		// while the next read is still scheduled gets an immediate read, and the
-		// single-timer guard keeps the cadence from doubling.
+	function startLiveRead(): void {
 		const generation = liveGeneration;
 		livePollInFlight = true;
+		lastLiveReadAt = Date.now();
 		void pollLiveChildren(generation).finally(() => {
 			livePollInFlight = false;
+			if (liveQueued && generation === liveGeneration) {
+				liveQueued = false;
+				startLiveRead();
+			}
 		});
 	}
 
-	/** Schedule the next live read; unref'd so it never holds the process open. */
-	function scheduleLivePoll(generation: number): void {
-		if (livePollTimer !== undefined) return;
+	/**
+	 * Read the live view because something announced a change.
+	 *
+	 * The announcements are pi-subagents' job-view notice, the progress of the
+	 * `subagent` tool call hosting a foreground child, and the async lifecycle
+	 * notices. They repeat and arrive in bursts, so an unforced read waits out
+	 * the coalesce window — a burst must fold into one read, and a notice inside
+	 * the window has nothing new to say — while a forced one (a launch, a
+	 * completion, a tool call opening or closing) reads at once. Either way the
+	 * quiet-period watcher is re-armed, so a notice that goes unanswered cannot
+	 * outlive the fallback cadence.
+	 */
+	function triggerLiveRead(force = false): void {
+		if (!pi.events || liveUnsupported) return;
+		if (livePollInFlight) {
+			liveQueued = true;
+			return;
+		}
+		if (!force && Date.now() - lastLiveReadAt < liveCoalesceMs) {
+			armLiveWatchdog();
+			return;
+		}
+		startLiveRead();
+	}
+
+	/**
+	 * Arm the quiet-period watcher, replacing any earlier arm; unref'd so it
+	 * never holds the process open.
+	 *
+	 * Every notice re-arms it, so while notices arrive the watcher never fires;
+	 * it only reads when children are running and nothing has been heard for a
+	 * full interval, which is the fallback a pi-subagents without the notices
+	 * runs on — and the safety net a missed notice falls back to.
+	 */
+	function armLiveWatchdog(): void {
+		const generation = liveGeneration;
+		if (livePollTimer !== undefined) clearTimeout(livePollTimer);
 		livePollTimer = setTimeout(() => {
 			livePollTimer = undefined;
 			if (liveUnsupported || generation !== liveGeneration) return;
-			// A triggered read is out: keep the cadence by trying again later,
-			// rather than running a second read beside it.
+			// A triggered read is out: it will refresh the view itself, and its
+			// result re-arms the watcher, so queue behind it rather than reading
+			// beside it.
 			if (livePollInFlight) {
-				scheduleLivePoll(generation);
+				liveQueued = true;
 				return;
 			}
-			livePollInFlight = true;
-			void pollLiveChildren(generation).finally(() => {
-				livePollInFlight = false;
-			});
-		}, LIVE_POLL_MS);
+			startLiveRead();
+		}, liveWatchdogMs);
 		livePollTimer.unref?.();
 	}
 
@@ -533,7 +604,11 @@ export default function tokenRate(pi: ExtensionAPI) {
 		for (const entry of entries) liveChildren.set(entry.key, entry);
 		liveTruncated = fleet.truncated;
 		refreshChildSnapshot();
-		if (fleet.totalActive > 0 || foregroundSubagentCalls > 0) scheduleLivePoll(generation);
+		// Something is still running — a child the fleet lists, or a `subagent`
+		// call open ahead of its child's registration: the watcher holds the
+		// fallback cadence until a notice — or its own next read — replaces it.
+		// Nothing listed and nothing open means nothing is left to read.
+		if (fleet.totalActive > 0 || openSubagentCalls > 0) armLiveWatchdog();
 	}
 
 	/** Drop the scheduled live read and everything the live view held. */
@@ -547,15 +622,16 @@ export default function tokenRate(pi: ExtensionAPI) {
 		heldChildren.clear();
 		liveTruncated = false;
 		completionNoticeSincePoll = false;
-		foregroundSubagentCalls = 0;
+		liveQueued = false;
+		openSubagentCalls = 0;
 	}
 
 	/**
 	 * Listen for pi-subagents' readiness notice, which also arrives after a
 	 * `/reload` of either extension. The subscription outlives session switches,
 	 * so it is re-armed rather than stacked: `session_start` fires for every
-	 * session the process opens. Async lifecycle notices are subscribed here
-	 * too: they are the announcements that start and stop the live reads.
+	 * session the process opens. The change notices are subscribed here too:
+	 * they are what starts and stops the live reads.
 	 */
 	function subscribeSubagentRpc(): void {
 		const bus = pi.events;
@@ -569,7 +645,7 @@ export default function tokenRate(pi: ExtensionAPI) {
 				requestChildUsage(true);
 			}),
 		);
-		state.busSubscriptions.push(bus.on(SUBAGENT_ASYNC_STARTED, () => ensureLivePolling()));
+		state.busSubscriptions.push(bus.on(SUBAGENT_ASYNC_STARTED, () => triggerLiveRead(true)));
 		state.busSubscriptions.push(
 			bus.on(SUBAGENT_ASYNC_COMPLETE, () => {
 				// The finished child's accounting is final now, and siblings may
@@ -577,7 +653,15 @@ export default function tokenRate(pi: ExtensionAPI) {
 				// without a dip or a double count, and keep reading the rest.
 				completionNoticeSincePoll = true;
 				requestChildUsage(true);
-				ensureLivePolling();
+				triggerLiveRead(true);
+			}),
+		);
+		state.busSubscriptions.push(
+			bus.on(SUBAGENT_JOBS_CHANGED, () => {
+				// pi-subagents says its view of the running children changed — a
+				// run started, moved on, produced tokens, or finished — which is the
+				// whole reason a cadence existed: read because something changed.
+				triggerLiveRead();
 			}),
 		);
 	}
@@ -670,12 +754,25 @@ export default function tokenRate(pi: ExtensionAPI) {
 		state.ctx = ctx;
 		state.model.observe(Date.now());
 		// A foreground child runs inside a `subagent` tool call, so the call
-		// itself is the announcement that live reading should cover it.
+		// opening is the announcement that live reading should cover it, and the
+		// call being open holds the fallback cadence until the fleet lists the
+		// child — which matters exactly when nothing else will announce it.
 		if (event.toolName === "subagent") {
-			foregroundSubagentCalls++;
-			ensureLivePolling();
+			openSubagentCalls++;
+			triggerLiveRead(true);
 		}
 		render(true);
+	});
+
+	// A foreground child reports its progress through updates to the tool call
+	// hosting it — a foreground run is not a background job, so the job-view
+	// notice never fires for it. Every update is a change worth reading the
+	// live view for; the read is coalesced, so a child streaming updates at its
+	// own pace still costs at most one read per window.
+	pi.on("tool_execution_update", async (event, ctx) => {
+		if (event.toolName !== "subagent") return;
+		state.ctx = ctx;
+		triggerLiveRead();
 	});
 
 	pi.on("tool_execution_end", async (event, ctx) => {
@@ -687,10 +784,10 @@ export default function tokenRate(pi: ExtensionAPI) {
 		// cost report can count it now; one more live read lets the fleet view
 		// drop it, and the reads stop once nothing is left.
 		if (event.toolName === "subagent") {
-			foregroundSubagentCalls = Math.max(0, foregroundSubagentCalls - 1);
+			openSubagentCalls = Math.max(0, openSubagentCalls - 1);
 			completionNoticeSincePoll = true;
 			requestChildUsage(true);
-			ensureLivePolling();
+			triggerLiveRead(true);
 		}
 		render(true);
 	});

@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.2] - 2026-10-29
+
+### Changed
+
+- Live subagent reads are driven by notices instead of a cadence. While
+  children ran, the live view was read every two seconds whether anything had
+  changed or not. pi-subagents now announces every change to its background
+  job view (`subagent:jobs-changed`, 0.83.0+), and a foreground child reports
+  progress through the `subagent` tool call hosting it, so a read happens when
+  something actually changed: notices are coalesced to at most one read per
+  second, a notice that arrives while a read is in flight queues one trailing
+  read, and launch and completion notices still read at once. A quiet-period
+  watcher keeps the old two-second cadence while children run — or a
+  `subagent` call hosting one is still open, ahead of the fleet listing it —
+  and no notice arrives, so a pi-subagents older than the notices, and any
+  session it never sends them in, falls back to exactly the polling this
+  replaces. The `cost` accounting is untouched: still read at turn boundaries
+  only, exactly as its contract asks.
+
+### Fixed
+
+- Live reads survive a `/reload` that leaves runs behind: any notice now
+  opens a read — including the job-view changes a reloaded pi-subagents emits
+  for runs that survived the reload — and a read that reports any child
+  active sustains the fallback cadence on its own. Before, async runs left
+  behind by a reload were read only at their completion notice, and a
+  foreground child whose call opened before the reload kept a stale total
+  until its call ended.
+
 ## [0.3.1] - 2026-10-22
 
 ### Added
@@ -123,6 +154,8 @@ All notable changes to this project are documented in this file. The format foll
   average, the session peak and the session output, plus `/token-rate stats`,
   `/token-rate reset` and configurable position, detail, tick and window.
 
+[0.3.2]: https://github.com/ningh123/pi-token-rate/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/ningh123/pi-token-rate/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ningh123/pi-token-rate/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ningh123/pi-token-rate/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ningh123/pi-token-rate/releases/tag/v0.1.0

@@ -66,7 +66,9 @@ const theme = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function createHarness(options: { mode?: "tui" | "print"; events?: boolean } = {}): Harness {
+function createHarness(
+	options: { mode?: "tui" | "print"; events?: boolean; liveCoalesceMs?: number; liveWatchdogMs?: number } = {},
+): Harness {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, RegisteredCommand>();
 	const widgets: (WidgetFactory | undefined)[] = [];
@@ -158,7 +160,7 @@ function createHarness(options: { mode?: "tui" | "print"; events?: boolean } = {
 		},
 	};
 
-	tokenRate(pi as never);
+	tokenRate(pi as never, { liveCoalesceMs: options.liveCoalesceMs, liveWatchdogMs: options.liveWatchdogMs });
 
 	const tui = { requestRender: () => {} };
 
@@ -1054,8 +1056,8 @@ describe("subagent children", () => {
 	}
 
 	/** A session with one measured reply, ready for a cost report. */
-	async function startedHarness(): Promise<Harness> {
-		const harness = createHarness();
+	async function startedHarness(timing: { liveCoalesceMs?: number; liveWatchdogMs?: number } = {}): Promise<Harness> {
+		const harness = createHarness(timing);
 		await harness.emit("session_start", { reason: "startup" });
 		await harness.emit("turn_start", {});
 		await harness.emit("message_start", { message: { role: "assistant" } });
@@ -1318,6 +1320,126 @@ describe("subagent children", () => {
 		harness.answerStatus({ fleet: { version: 1, entries: [], totalActive: 0, omitted: 0 } });
 		await sleep(0);
 		assert.match(harness.line(120), /sub 3\.2k tok/);
+	});
+
+	it("reads again when the foreground child's own tool call reports progress", async () => {
+		const harness = await startedHarness({ liveCoalesceMs: 40 });
+		await harness.emit("tool_execution_start", {
+			type: "tool_execution_start",
+			toolCallId: "t1",
+			toolName: "subagent",
+			args: {},
+		});
+		harness.answerStatus({ fleet: fleetView(3000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 3\.0k tok/);
+
+		// A foreground run is not a background job, so the job-view notice never
+		// fires for it: the progress updates of the tool call hosting it are its
+		// own signal, and a read they trigger picks up the child's next turn.
+		await sleep(60);
+		await harness.emit("tool_execution_update", {
+			type: "tool_execution_update",
+			toolCallId: "t1",
+			toolName: "subagent",
+			args: {},
+			partialResult: { content: [], details: { mode: "single", results: [] } },
+		});
+		harness.answerStatus({ fleet: fleetView(3500) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 3\.5k tok/, harness.line(120));
+	});
+
+	it("ignores progress from tools other than the one hosting a child", async () => {
+		const harness = await startedHarness();
+		await harness.emit("tool_execution_update", {
+			type: "tool_execution_update",
+			toolCallId: "b1",
+			toolName: "bash",
+			args: {},
+			partialResult: { content: [] },
+		});
+		await sleep(0);
+		assert.equal(harness.rpcRequests.filter((request) => request.method === "status").length, 0);
+	});
+
+	it("reads when pi-subagents announces its job view changed, coalescing bursts", async () => {
+		const harness = await startedHarness({ liveCoalesceMs: 40 });
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k tok/);
+
+		// A notice inside the coalesce window has nothing new to say: no second
+		// read is sent for it.
+		harness.busEmit("subagent:jobs-changed", { version: 1 });
+		await sleep(0);
+		assert.equal(harness.rpcRequests.filter((request) => request.method === "status").length, 1);
+
+		// Past the window, the same notice is the change itself: the read picks
+		// up the tokens the child produced since.
+		await sleep(60);
+		harness.busEmit("subagent:jobs-changed", { version: 1 });
+		harness.answerStatus({ fleet: fleetView(8000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 8\.0k tok/, harness.line(120));
+		assert.equal(harness.rpcRequests.filter((request) => request.method === "status").length, 2);
+	});
+
+	it("runs a notice that arrived while a read was in flight after it", async () => {
+		const harness = await startedHarness();
+		// The launch notice starts a read, and the job-view notice lands while
+		// that read is still waiting for its reply: it is queued, not dropped.
+		harness.busEmit("subagent:async-started", {});
+		harness.busEmit("subagent:jobs-changed", { version: 1 });
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k tok/);
+
+		// The queued notice reads as soon as the first one lands, so the change
+		// it announced is not missed.
+		harness.answerStatus({ fleet: fleetView(6500) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 6\.5k tok/, harness.line(120));
+		assert.equal(harness.rpcRequests.filter((request) => request.method === "status").length, 2);
+	});
+
+	it("keeps reading on the watchdog while children run and no notice arrives", async () => {
+		const harness = await startedHarness({ liveWatchdogMs: 80 });
+		// A pi-subagents older than the change notices never sends them, so the
+		// reads fall back to the cadence the notices replaced.
+		harness.busEmit("subagent:async-started", {});
+		harness.answerStatus({ fleet: fleetView(5000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 5\.0k tok/);
+
+		await sleep(140);
+		harness.answerStatus({ fleet: fleetView(6000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 6\.0k tok/, harness.line(120));
+		assert.equal(harness.rpcRequests.filter((request) => request.method === "status").length, 2);
+	});
+
+	it("sustains the cadence while a foreground call is open, before the fleet lists its child", async () => {
+		const harness = await startedHarness({ liveWatchdogMs: 80 });
+		await harness.emit("tool_execution_start", {
+			type: "tool_execution_start",
+			toolCallId: "t1",
+			toolName: "subagent",
+			args: {},
+		});
+		// The first read races the child's registration in the fleet view: an
+		// older pi-subagents lists nothing yet and never sends a notice, so only
+		// the open call holds the cadence — without it the child would stay
+		// invisible until its call ended.
+		harness.answerStatus({ fleet: { version: 1, entries: [], totalActive: 0, omitted: 0 } });
+		await sleep(0);
+		assert.doesNotMatch(harness.line(120), /sub /, harness.line(120));
+
+		await sleep(140);
+		harness.answerStatus({ fleet: fleetView(3000) });
+		await sleep(0);
+		assert.match(harness.line(120), /sub 3\.0k tok/, harness.line(120));
 	});
 
 	it("falls back to cost alone when the bridge has no fleet view", async () => {

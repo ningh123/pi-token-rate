@@ -106,8 +106,11 @@ ends, the provider's figure replaces the estimate and recalibrates future ones.
   A summary that never reports usage is not recorded.
 - **Subagents.** Children are separate pi sessions, so their output never
   enters a rate: it is accounted by pi-subagents and shown as its own total.
-  `sub 92k+ tok` marks a lower bound; without pi-subagents installed the
-  segment and the row never appear.
+  Live totals are read when pi-subagents announces a change — its job-view
+  notice for background runs, the hosting `subagent` tool call's progress for
+  foreground ones — with a quiet-period watcher as the fallback, never a fixed
+  cadence. `sub 92k+ tok` marks a lower bound; without pi-subagents installed
+  the segment and the row never appear.
 
 ## License
 
