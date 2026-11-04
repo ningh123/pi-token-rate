@@ -23,3 +23,15 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      - name: Assert the packaged files cover the extension entry points
+        # npm pack --dry-run always exits 0, so the file list has to be
+        # asserted explicitly: a "files" whitelist that misses a module ships
+        # a package that installs clean and crashes on load, with every check
+        # above still green.
+        run: |
+          npm pack --dry-run --json | node -e '
+            const expected = ["index.ts", "metrics.ts", "rate-view.ts", "CHANGELOG.md"];
+            const packed = JSON.parse(require("fs").readFileSync(0, "utf8"))[0].files.map((f) => f.path);
+            const missing = expected.filter((e) => !packed.some((p) => p === e || p.startsWith(e + "/")));
+            if (missing.length) { console.error("pack missing:", missing.join(", ")); process.exit(1); }
+          '
