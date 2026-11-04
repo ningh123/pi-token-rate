@@ -683,7 +683,8 @@ export default function tokenRate(pi: ExtensionAPI, timing: LiveReadTiming = {})
 
 	pi.on("session_start", async (_event, ctx) => {
 		state.ctx = ctx;
-		state.prefs = { ...DEFAULT_PREFS, ...readPersistedPrefs(ctx) };
+		const persisted = readPersistedState(ctx);
+		state.prefs = { ...DEFAULT_PREFS, ...persisted.prefs };
 		// The fresh session owns nothing yet: whatever the previous session was
 		// reading belongs to its model, and its outstanding replies must not land
 		// in this one.
@@ -694,7 +695,7 @@ export default function tokenRate(pi: ExtensionAPI, timing: LiveReadTiming = {})
 		// Seed from this session's own history, so statistics cover the whole
 		// session instead of only the part observed since the last load.
 		const model = new SessionRateModel();
-		for (const record of readPersistedRecords(ctx)) model.mergeRecord(record);
+		for (const record of persisted.records) model.mergeRecord(record);
 		// Applying the resolution points the fresh model at the configured trace and
 		// restarts it. The live series needs no starting: a new model has no history,
 		// and it takes its clock from the first observation that reaches it.
@@ -1020,51 +1021,58 @@ export default function tokenRate(pi: ExtensionAPI, timing: LiveReadTiming = {})
 }
 
 /**
- * Read the rate records this session already holds, so statistics cover the
- * whole session rather than starting at the last load.
+ * Read the rate records and display preferences this session already
+ * holds, so statistics cover the whole session rather than starting at the
+ * last load. One walk of the branch serves both readers.
  */
-function readPersistedRecords(ctx: ExtensionContext): MessageRecord[] {
+function readPersistedState(ctx: ExtensionContext): { records: MessageRecord[]; prefs: Partial<DisplayPrefs> } {
 	const records: MessageRecord[] = [];
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type !== "custom" || entry.customType !== RECORD_ENTRY_TYPE) continue;
-		const data = entry.data as Partial<RateRecordEntry> | undefined;
-		if (!data || typeof data.tokens !== "number" || typeof data.elapsedMs !== "number") continue;
-		records.push({
-			tokens: data.tokens,
-			elapsedMs: data.elapsedMs,
-			// Times measured from the old reference are dropped rather than mixed
-			// in with the current definition.
-			ttftMs: data.ttftFrom === "turn" && typeof data.ttftMs === "number" ? data.ttftMs : undefined,
-			ttftFrom: data.ttftFrom,
-			// A buffered response has to stay out of the peak and the spread across a
-			// reload too: the record that is read back has to be the record that was
-			// written, or the rate it was held back from reappears with no caveat.
-			frontLoadedFirstChunk: data.frontLoadedFirstChunk === true ? true : undefined,
-			peakRate: 0,
-			exact: data.exact === true,
-			// An unknown kind is dropped rather than trusted: the session file is
-			// writable data, and a record that cannot be identified is not one this
-			// version knows how to keep out of the rates.
-			kind: data.kind === "compaction" || data.kind === "branch-summary" ? data.kind : undefined,
-		});
-	}
-	return records;
-}
-
-/** Read the display preferences stored earlier in this session. */
-function readPersistedPrefs(ctx: ExtensionContext): Partial<DisplayPrefs> {
 	const prefs: Partial<DisplayPrefs> = {};
 	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type !== "custom" || entry.customType !== PREFS_ENTRY_TYPE) continue;
-		const data = entry.data as Partial<DisplayPrefs> | undefined;
-		if (!data) continue;
-		if (typeof data.enabled === "boolean") prefs.enabled = data.enabled;
-		if (data.position === "above" || data.position === "below") prefs.position = data.position;
-		if (data.detail && (DETAIL_LEVELS as readonly string[]).includes(data.detail)) prefs.detail = data.detail;
-		if (data.tick && data.tick in TICK_CHOICES) prefs.tick = data.tick;
-		if (data.window && data.window in WINDOW_CHOICES) prefs.window = data.window;
+		if (entry.type !== "custom") continue;
+		if (entry.customType === RECORD_ENTRY_TYPE) {
+			const record = parseRecordEntry(entry.data);
+			if (record) records.push(record);
+		} else if (entry.customType === PREFS_ENTRY_TYPE) {
+			applyPrefsEntry(entry.data, prefs);
+		}
 	}
-	return prefs;
+	return { records, prefs };
+}
+
+/** One stored rate record; undefined for an entry this version cannot read back. */
+function parseRecordEntry(data: unknown): MessageRecord | undefined {
+	const entry = data as Partial<RateRecordEntry> | undefined;
+	if (!entry || typeof entry.tokens !== "number" || typeof entry.elapsedMs !== "number") return undefined;
+	return {
+		tokens: entry.tokens,
+		elapsedMs: entry.elapsedMs,
+		// Times measured from the old reference are dropped rather than mixed
+		// in with the current definition.
+		ttftMs: entry.ttftFrom === "turn" && typeof entry.ttftMs === "number" ? entry.ttftMs : undefined,
+		ttftFrom: entry.ttftFrom,
+		// A buffered response has to stay out of the peak and the spread across a
+		// reload too: the record that is read back has to be the record that was
+		// written, or the rate it was held back from reappears with no caveat.
+		frontLoadedFirstChunk: entry.frontLoadedFirstChunk === true ? true : undefined,
+		peakRate: 0,
+		exact: entry.exact === true,
+		// An unknown kind is dropped rather than trusted: the session file is
+		// writable data, and a record that cannot be identified is not one this
+		// version knows how to keep out of the rates.
+		kind: entry.kind === "compaction" || entry.kind === "branch-summary" ? entry.kind : undefined,
+	};
+}
+
+/** Fold one stored preferences entry into `prefs`; later entries win, as the branch order makes them newer. */
+function applyPrefsEntry(data: unknown, prefs: Partial<DisplayPrefs>): void {
+	const entry = data as Partial<DisplayPrefs> | undefined;
+	if (!entry) return;
+	if (typeof entry.enabled === "boolean") prefs.enabled = entry.enabled;
+	if (entry.position === "above" || entry.position === "below") prefs.position = entry.position;
+	if (entry.detail && (DETAIL_LEVELS as readonly string[]).includes(entry.detail)) prefs.detail = entry.detail;
+	if (entry.tick && entry.tick in TICK_CHOICES) prefs.tick = entry.tick;
+	if (entry.window && entry.window in WINDOW_CHOICES) prefs.window = entry.window;
 }
 
 /** Strip undefined fields so the stored entry stays small. */
